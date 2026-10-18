@@ -391,7 +391,7 @@ ST 30.09.26
 Static Sharing Solver (Aufteilungsschlüssel): introduction of allocation keys that defines sharing volume..
 """
 class SolverStaticSharing(SolverGeneralModel):
-    def __init__(self, allocation_keys, prosumer, p_p2p, residual_price=0.0, p_feed_in=0.08, *args, **kwargs):
+    def __init__(self, allocation_keys, prosumer, p_p2p, residual_price, p_feed_in, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         if abs(sum(allocation_keys.values()) - 1.0) > 1e-9:
@@ -524,6 +524,185 @@ class SolverStaticSharing(SolverGeneralModel):
                 })
 
         return surplus_data
+
+    def prosumer_energy_balance(self, N):
+
+        p = self.prosumer
+
+        results = {
+            "generation": [],
+            "shared": [],
+            "self_consumption": [],
+            "grid_import": [],
+            "surplus": []
+        }
+
+        for t in range(N):
+
+            # PV-Erzeugung des Prosumers
+            generation = self.sunf(p, t) * self.pv[p]
+
+            # Tatsächlich geteilte Energie
+            shared = sum(
+                self.model.imported[c, t].value
+                for c in self.allocation_keys
+            )
+
+            # Verbleibende PV-Energie
+            residual = max(0, generation - shared)
+
+            # Verbrauch des Prosumers
+            consumption = self.consf(p, t)
+
+            # Eigenverbrauch aus verbleibender PV
+            self_consumption = min(residual, consumption)
+
+            # Reststrombezug aus dem Netz
+            grid_import = max(0, consumption - self_consumption)
+
+            # PV-Überschuss nach Eigenverbrauch
+            surplus = max(0, residual - self_consumption)
+
+            results["generation"].append(generation)
+            results["shared"].append(shared)
+            results["self_consumption"].append(self_consumption)
+            results["grid_import"].append(grid_import)
+            results["surplus"].append(surplus)
+
+        return results
+
+    def prosumer_grid_balance(self, model, t):
+
+        p = self.prosumer
+
+        generation = self.sunf(p, t) * self.pv[p]
+        consumption = self.consf(p, t)
+
+        # Energy Sharing entsprechend den statischen Schlüsseln
+        shared = sum(
+            min(
+                alpha * generation,
+                self.consf(c, t)
+            )
+            for c, alpha in self.allocation_keys.items()
+        )
+
+        # PV-Menge, die nach Energy Sharing verbleibt
+        residual = max(0, generation - shared)
+
+        # Eigenverbrauch des Prosumers
+        self_consumption = min(residual, consumption)
+
+        # Benötigter Netzbezug
+        grid_import = max(0, consumption - self_consumption)
+
+        return model.el_in[p, t] == grid_import
+
+    def prosumer_grid_export(self, model, t):
+
+        p = self.prosumer
+
+        generation = self.sunf(p, t) * self.pv[p]
+        consumption = self.consf(p, t)
+
+        shared = sum(
+            min(
+                alpha * generation,
+                self.consf(c, t)
+            )
+            for c, alpha in self.allocation_keys.items()
+        )
+
+        residual = max(0, generation - shared)
+
+        self_consumption = min(residual, consumption)
+
+        surplus = max(0, residual - self_consumption)
+
+        return model.el_out[p, t] == surplus
+
+    def prosumer_costs(self, N, grid_price=0.35):
+
+        balance = self.prosumer_energy_balance(N)
+
+        # Kosten für Reststrombezug
+        grid_cost = sum(
+            balance["grid_import"][t] * grid_price
+            for t in range(N)
+        )
+
+        # Erlöse durch Energy Sharing
+        sharing_revenue = sum(
+            balance["shared"][t] * self.p_p2p
+            for t in range(N)
+        )
+
+        # Erlöse für verbleibende Überschusseinspeisung
+        residual_revenue = sum(
+            balance["surplus"][t] * self.residual_price
+            for t in range(N)
+        )
+
+        # Nettostromkosten
+        net_cost = (
+            grid_cost
+            - sharing_revenue
+            - residual_revenue
+        )
+
+        self_consumption_savings = sum(
+            balance["self_consumption"][t] * grid_price
+            for t in range(N)
+        )
+
+        return {
+            "grid_cost": grid_cost,
+            "sharing_revenue": sharing_revenue,
+            "residual_revenue": residual_revenue,
+            "net_cost": net_cost,
+            "self_consumption_savings": self_consumption_savings
+        }
+
+    def prosumer_reference_costs(
+        self,
+        N,
+        grid_price
+    ):
+        p = self.prosumer
+
+        total_generation = 0
+        total_self_consumption = 0
+        total_grid_import = 0
+        total_feed_in = 0
+
+        for t in range(N):
+
+            generation = self.sunf(p, t) * self.pv[p]
+            consumption = self.consf(p, t)
+
+            self_consumption = min(generation, consumption)
+            grid_import = max(0, consumption - generation)
+            feed_in = max(0, generation - consumption)
+
+            total_generation += generation
+            total_self_consumption += self_consumption
+            total_grid_import += grid_import
+            total_feed_in += feed_in
+
+        grid_cost = total_grid_import * grid_price
+        feed_in_revenue = total_feed_in * self.p_feed_in
+
+        net_cost = grid_cost - feed_in_revenue
+
+        return {
+            "generation": total_generation,
+            "self_consumption": total_self_consumption,
+            "grid_import": total_grid_import,
+            "feed_in": total_feed_in,
+            "grid_cost": grid_cost,
+            "feed_in_revenue": feed_in_revenue,
+            "net_cost": net_cost
+        }
     
     def print_community_surplus(self):
 
@@ -561,6 +740,54 @@ class SolverStaticSharing(SolverGeneralModel):
 
         return total_surplus
 
+    def consumer_costs(
+        self,
+        N,
+        grid_price=0.35,
+        sharing_price=0.20
+        ):
+        results = {}
+
+        for c in self.allocation_keys:
+
+            total_consumption = 0
+            total_shared = 0
+            total_grid_import = 0
+
+            for t in range(N):
+
+                consumption = self.consf(c, t)
+
+                shared = self.model.imported[c, t].value
+
+                grid_import = self.model.el_in[c, t].value
+
+                total_consumption += consumption
+                total_shared += shared
+                total_grid_import += grid_import
+
+            # Referenz: gesamter Verbrauch aus dem Netz
+            cost_without_es = total_consumption * grid_price
+
+            # Mit Energy Sharing
+            cost_grid = total_grid_import * grid_price
+            cost_sharing = total_shared * sharing_price
+
+            cost_with_es = cost_grid + cost_sharing
+
+            savings = cost_without_es - cost_with_es
+
+            results[c] = {
+                "consumption": total_consumption,
+                "shared": total_shared,
+                "grid_import": total_grid_import,
+                "cost_without_es": cost_without_es,
+                "cost_with_es": cost_with_es,
+                "savings": savings
+            }
+
+        return results
+
     # ---------------------------------------------------------
     # SOLVE
     # ---------------------------------------------------------
@@ -597,6 +824,8 @@ class SolverStaticSharing(SolverGeneralModel):
         #self.model.sharingDemand = Constraint(self.model.H, self.model.T, rule=self.sharing_demand_limit)
         self.model.staticSharing = Constraint(self.model.H, self.model.T, rule=self.static_sharing)
         self.model.onlyProsumerExports = Constraint(self.model.H, self.model.T, rule=self.only_prosumer_exports)
+        self.model.prosumerGridBalance = Constraint(self.model.T, rule=self.prosumer_grid_balance)
+        self.model.prosumerGridExport = Constraint(self.model.T, rule=self.prosumer_grid_export)
         #self.model.prosumerNoImport = Constraint(self.model.T, rule=self.prosumer_no_import)
         self.model.onlyAllocatedConsumersImport = Constraint(self.model.H, self.model.T, rule=self.only_allocated_consumers_import)
         
