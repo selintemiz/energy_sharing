@@ -532,7 +532,7 @@ class SolverStaticSharing(SolverGeneralModel):
         results = {
             "generation": [],
             "shared": [],
-            "self_consumption": [],
+            "self_consumption_own_pv": [],
             "grid_import": [],
             "surplus": []
         }
@@ -555,17 +555,17 @@ class SolverStaticSharing(SolverGeneralModel):
             consumption = self.consf(p, t)
 
             # Eigenverbrauch aus verbleibender PV
-            self_consumption = min(residual, consumption)
+            self_consumption_own_pv = min(residual, consumption)
 
             # Reststrombezug aus dem Netz
-            grid_import = max(0, consumption - self_consumption)
+            grid_import = max(0, consumption - self_consumption_own_pv)
 
             # PV-Überschuss nach Eigenverbrauch
-            surplus = max(0, residual - self_consumption)
+            surplus = max(0, residual - self_consumption_own_pv)
 
             results["generation"].append(generation)
             results["shared"].append(shared)
-            results["self_consumption"].append(self_consumption)
+            results["self_consumption_own_pv"].append(self_consumption_own_pv)
             results["grid_import"].append(grid_import)
             results["surplus"].append(surplus)
 
@@ -591,10 +591,10 @@ class SolverStaticSharing(SolverGeneralModel):
         residual = max(0, generation - shared)
 
         # Eigenverbrauch des Prosumers
-        self_consumption = min(residual, consumption)
+        self_consumption_own_pv = min(residual, consumption)
 
         # Benötigter Netzbezug
-        grid_import = max(0, consumption - self_consumption)
+        grid_import = max(0, consumption - self_consumption_own_pv)
 
         return model.el_in[p, t] == grid_import
 
@@ -615,9 +615,9 @@ class SolverStaticSharing(SolverGeneralModel):
 
         residual = max(0, generation - shared)
 
-        self_consumption = min(residual, consumption)
+        self_consumption_own_pv = min(residual, consumption)
 
-        surplus = max(0, residual - self_consumption)
+        surplus = max(0, residual - self_consumption_own_pv)
 
         return model.el_out[p, t] == surplus
 
@@ -651,7 +651,7 @@ class SolverStaticSharing(SolverGeneralModel):
         )
 
         self_consumption_savings = sum(
-            balance["self_consumption"][t] * grid_price
+            balance["self_consumption_own_pv"][t] * grid_price
             for t in range(N)
         )
 
