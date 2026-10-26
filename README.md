@@ -253,6 +253,3 @@ The expected input files are:
 - All files must be provided in CSV format.
 - Time indexing must be consistent across all T-dimensional files (`cons.csv`, `price.csv`, `sun.csv`).
 - The ordering of users must be consistent across all N-dimensional files (`cons.csv`, `pv.csv`, `battery.csv`).
-
-For a complete example dataset and usage workflow, refer to the **Getting Started notebook**.
-# energy_sharing
