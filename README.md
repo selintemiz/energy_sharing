@@ -255,3 +255,4 @@ The expected input files are:
 - The ordering of users must be consistent across all N-dimensional files (`cons.csv`, `pv.csv`, `battery.csv`).
 
 For a complete example dataset and usage workflow, refer to the **Getting Started notebook**.
+# energy_sharing
