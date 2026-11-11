@@ -67,345 +67,282 @@ with col_author:
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FOLDER = BASE_DIR / "data_test"
 
-N = 96
+N = 35040
 DT = 0.25
-PROSUMER = 0
-CONSUMERS = [1, 2, 3]
+
+
+
+# Österreichische EEG: 2025 geltende, arbeitsbezogene Netznutzungsrabatte.
+# Die Rabatte beziehen sich nur auf die Netzkomponente des Sharing-Bezugs.
+AT_NETWORK_DISCOUNTS = {
+    "Keine Vergünstigung / BEG österreichweit": 0.0,
+    "EEG lokal (NE 6/7)": 0.57,
+    "EEG regional (NE 6/7)": 0.28,
+    "EEG regional (NE 4/5)": 0.64,
+}
+
+
+def sharing_tariff(p2p, network, levies, electricity_tax, service,
+                   discount, eeg_exempt, renewable_contribution, bonus):
+    """Geteilte kWh: P2P + reduzierte Netzarbeit + ggf. Abgaben + Service.
+
+    Bonus ist ein externer, hypothetischer Zuschuss an den Erzeuger.
+    Er wird NICHT als Kostenbestandteil dem Consumer zugeschlagen.
+    """
+    network_paid = network * (1.0 - discount)
+    levies_paid = levies - (renewable_contribution if eeg_exempt else 0.0)
+    if levies_paid < -1e-9:
+        raise ValueError("Erneuerbaren-Förderbeitrag übersteigt Umlagen und Abgaben.")
+    tax_paid = 0.0 if eeg_exempt else electricity_tax
+    return {
+        "p_sharing_consumer": p2p + network_paid + max(0.0, levies_paid) + tax_paid + service,
+        "p_network_paid": network_paid,
+        "p_levies_paid": max(0.0, levies_paid),
+        "p_tax_paid": tax_paid,
+        "p_bonus": bonus,
+        "p_network_discount": discount,
+        "eeg_exempt": eeg_exempt,
+        "p_renewable_contribution": renewable_contribution,
+    }
 
 
 # ============================================================
 # 2. SIMULATIONSFUNKTION
 # ============================================================
 
-def run_simulation(allocation_keys, prices, pv_capacities):
+def run_simulation(allocation_keys_by_prosumer, prices, pv_capacities, members_config):
+    """Deterministische statische PV-Zuteilung ohne Umverteilung oder Speicher.
 
-    # Eingangsdaten laden
+    Verwendet 35.040 synthetische Viertelstundenwerte für das Kalenderjahr 2025.
+    Die Profile sind plausible Szenarien, keine gemessenen ENTSO-E-Daten.
+    """
     opt = Optimizer.from_folder2(str(DATA_FOLDER))
-
-    # PV-Leistung für diesen Simulationslauf anpassen
-    for h, capacity in pv_capacities.items():
-        opt.pv[h] = capacity
-
-    # Solver erstellen
-    solver = opt.static_sharing_solver(
-        allocation_keys=allocation_keys,
-        prosumer=PROSUMER,
-        p_p2p=prices["p_sharing"],
-        p_feed_in=prices["p_feed_in"],
-        residual_price=prices["p_residual"]
-    )
-
-    # Optimierung
-    solver.solve(N)
-
-    # Bestehende Auswertungsmethoden
-    balance = solver.prosumer_energy_balance(N)
-
-    sharing = solver.prosumer_costs(
-        N=N,
-        grid_price=prices["p_grid"]
-    )
-
-    reference = solver.prosumer_reference_costs(
-        N=N,
-        grid_price=prices["p_grid"]
-    )
-
-    consumers = solver.consumer_costs(
-        N=N,
-        grid_price=prices["p_grid"],
-        sharing_price=prices["p_sharing_consumer"]
-    )
-
-    # --------------------------------------------------------
-    # Zeitreihen
-    # --------------------------------------------------------
-
-    time = pd.date_range(
-    start="2026-01-01 00:00",
-    periods=N,
-    freq="15min"
-)
-
-    generation = np.asarray(
-        balance["generation"], dtype=float
-    )
-    shared = np.asarray(
-        balance["shared"], dtype=float
-    )
-    self_pv = np.asarray(
-        balance["self_consumption_own_pv"], dtype=float
-    )
-    surplus = np.asarray(
-        balance["surplus"], dtype=float
-    )
-    grid_prosumer = np.asarray(
-        balance["grid_import"], dtype=float
-    )
-
-    df_time = pd.DataFrame({
-        "Stunde": time,
-        "PV-Erzeugung": generation,
-        "Energy Sharing": shared,
-        "Eigenverbrauch": self_pv,
-        "Netzeinspeisung": surplus,
-        "Netzbezug Prosumer": grid_prosumer
-    }).set_index("Stunde")
-
-    # --------------------------------------------------------
-    # Zeitreihen je ESC-Mitglied
-    # --------------------------------------------------------
-
+    member_ids = sorted(members_config)
+    prosumers = [h for h in member_ids if members_config[h]["role"] == "prosumer"]
+    consumers = [h for h in member_ids if h not in prosumers]
+    lengths = [len(opt.cons[h]) for h in member_ids] + [len(opt.sun[h]) for h in member_ids]
+    lengths.append(len(opt.price[0]))
+    if any(length != N for length in lengths):
+        raise ValueError(f"Jahresprofile benötigen genau {N} Viertelstundenwerte; gefunden: {lengths}")
+    n = N
+    time = pd.date_range("2025-01-01", periods=n, freq="15min")
+    demand = {h: np.asarray(opt.cons[h][:n], dtype=float) for h in member_ids}
+    generation = {
+        p: np.asarray(opt.sun[p][:n], dtype=float) * float(pv_capacities[p])
+        for p in prosumers
+    }
+    # Eigenanteil zuerst; andere PV-Anteile nur auf den noch offenen Bedarf.
+    # Dies vermeidet, dass ein Haushalt Energie über seinen Verbrauch hinaus erhält.
+    own = {h: np.zeros(n) for h in member_ids}
+    sharing_in = {h: np.zeros(n) for h in member_ids}
+    sharing_out = {p: np.zeros(n) for p in prosumers}
+    surplus = {p: np.zeros(n) for p in prosumers}
+    flows = {(p, h): np.zeros(n) for p in prosumers for h in member_ids if h != p}
+    for p in prosumers:
+        alpha = allocation_keys_by_prosumer[p]
+        own[p] = np.minimum(demand[p], alpha.get(p, 0.0) * generation[p])
+    remaining = {h: np.maximum(0.0, demand[h] - own[h]) for h in member_ids}
+    # Bei mehreren Prosumern: festgelegte Priorität nach Mitglieds-ID.
+    # Ungenutzte Zuteilungen werden nicht an andere Empfänger umverteilt.
+    for p in sorted(prosumers):
+        for h in member_ids:
+            if h == p:
+                continue
+            entitlement = allocation_keys_by_prosumer[p].get(h, 0.0) * generation[p]
+            used = np.minimum(entitlement, remaining[h])
+            flows[p, h] = used
+            sharing_in[h] += used
+            sharing_out[p] += used
+            remaining[h] -= used
+        surplus[p] = np.maximum(0.0, generation[p] - own[p] - sharing_out[p])
+    grid = remaining
+    df_time = pd.DataFrame(index=time)
+    df_time.index.name = "Stunde"
+    df_time["PV-Erzeugung"] = sum(generation.values(), np.zeros(n))
+    df_time["Energy Sharing"] = sum(sharing_out.values(), np.zeros(n))
+    df_time["Eigenverbrauch"] = sum(own.values(), np.zeros(n))
+    df_time["Netzeinspeisung"] = sum(surplus.values(), np.zeros(n))
+    df_time["Netzbezug Prosumer"] = sum((grid[p] for p in prosumers), np.zeros(n))
     member_timeseries = {}
-
-    for h in range(len(opt.cons)):
-
-        demand_h = np.array([
-            solver.consf(h, t)
-            for t in range(N)
-        ], dtype=float)
-
-        grid_h = np.array([
-            solver.model.el_in[h, t].value
-            for t in range(N)
-        ], dtype=float)
-
-        sharing_h = np.array([
-            solver.model.imported[h, t].value
-            for t in range(N)
-        ], dtype=float)
-
-        pv_h = np.array([
-            solver.sunf(h, t) * opt.pv[h]
-            for t in range(N)
-        ], dtype=float)
-
+    for h in member_ids:
         member_timeseries[h] = pd.DataFrame({
-            "Stunde": time,
-            "Verbrauch": demand_h,
-            "PV-Erzeugung": pv_h,
-            "Energy Sharing": sharing_h,
-            "Netzbezug": grid_h
-        }).set_index("Stunde")
-
-    # Eigenverbrauch und abgegebene Sharing-Energie
-    # für den bisherigen Prosumer 0 ergänzen
-    member_timeseries[PROSUMER]["Eigenverbrauch"] = self_pv
-    member_timeseries[PROSUMER]["Sharing-Abgabe"] = shared
-    member_timeseries[PROSUMER]["Netzeinspeisung"] = surplus
-
-    # Bei den übrigen Mitgliedern zunächst keine PV-Abgabe
-    for h in member_timeseries:
-        if h != PROSUMER:
-            member_timeseries[h]["Eigenverbrauch"] = 0.0
-            member_timeseries[h]["Sharing-Abgabe"] = 0.0
-            member_timeseries[h]["Netzeinspeisung"] = 0.0
-
-    # --------------------------------------------------------
-    # Consumer-Energiebilanzen
-    # --------------------------------------------------------
-
+            "Verbrauch": demand[h],
+            "PV-Erzeugung": generation.get(h, np.zeros(n)),
+            "Energy Sharing": sharing_in[h],
+            "Netzbezug": grid[h],
+            "Eigenverbrauch": own[h],
+            "Sharing-Abgabe": sharing_out.get(h, np.zeros(n)),
+            "Netzeinspeisung": surplus.get(h, np.zeros(n)),
+        }, index=time)
+        for col in ("Verbrauch", "Energy Sharing"):
+            df_time[f"{col} Mitglied {h}"] = member_timeseries[h][col]
+    pv_usage = {
+        p: {"Eigenverbrauch": float(own[p].sum()),
+            "Energy Sharing": float(sharing_out[p].sum()),
+            "Netzeinspeisung": float(surplus[p].sum())}
+        for p in prosumers
+    }
     consumer_rows = []
     total_consumer_savings = 0.0
-    total_consumer_grid = 0.0
-    total_consumer_demand = 0.0
-    total_consumer_shared = 0.0
-
-    for c in CONSUMERS:
-
-        demand = np.array([
-            solver.consf(c, t)
-            for t in range(N)
-        ], dtype=float)
-
-        shared_c = np.array([
-            solver.model.imported[c, t].value
-            for t in range(N)
-        ], dtype=float)
-
-        grid_c = np.array([
-            solver.model.el_in[c, t].value
-            for t in range(N)
-        ], dtype=float)
-
-        E_demand = demand.sum()
-        E_shared_c = shared_c.sum()
-        E_grid_c = grid_c.sum()
-
-        total_consumer_demand += E_demand
-        total_consumer_shared += E_shared_c
-        total_consumer_grid += E_grid_c
-        total_consumer_savings += consumers[c]["savings"]
-
+    for c in consumers:
+        e_demand, e_shared, e_grid = (float(x.sum()) for x in (demand[c], sharing_in[c], grid[c]))
+        without = e_demand * prices["p_grid"]
+        with_es = e_grid * prices["p_grid"] + e_shared * prices["p_sharing_consumer"]
+        total_consumer_savings += without - with_es
         consumer_rows.append({
-            "Teilnehmer": f"Consumer {c}",
-            "Verbrauch [kWh]": E_demand,
-            "Sharing [kWh]": E_shared_c,
-            "Netzbezug [kWh]": E_grid_c,
-            "Ohne ES [€]": consumers[c]["cost_without_es"],
-            "Mit ES [€]": consumers[c]["cost_with_es"],
-            "Ersparnis [€]": consumers[c]["savings"]
+            "Teilnehmer": f"Consumer {c}", "Verbrauch [kWh]": e_demand,
+            "PV-Eigenverbrauch [kWh]": 0.0, "Sharing-Bezug [kWh]": e_shared,
+            "Reststrombezug [kWh]": e_grid,
+            "Einspeisevergütung Reststrombezug [kWh]": e_demand,
+            "Einspeisevergütung Netzbezugskosten [€]": without,
+            "ES Reststrombezugskosten [€]": e_grid * prices["p_grid"],
+            "ES Sharing-Bezugskosten [€]": e_shared * prices["p_sharing_consumer"],
+            "Sharing [kWh]": e_shared, "Netzbezug [kWh]": e_grid,
+            "Ohne ES [€]": without, "Mit ES [€]": with_es,
+            "Ersparnis [€]": without - with_es
         })
-
-        df_time[f"Verbrauch Consumer {c}"] = demand
-        df_time[f"Sharing Consumer {c}"] = shared_c
-
-    df_consumers = pd.DataFrame(
-        consumer_rows
-    ).set_index("Teilnehmer")
-
-    # --------------------------------------------------------
-    # Prosumer-Kostenvergleich
-    # --------------------------------------------------------
-
-    revenue_sharing = (
-        sharing["sharing_revenue"]
-        + sharing["residual_revenue"]
+    df_consumers = pd.DataFrame(consumer_rows, columns=[
+        "Teilnehmer", "Verbrauch [kWh]", "PV-Eigenverbrauch [kWh]",
+        "Sharing-Bezug [kWh]", "Reststrombezug [kWh]",
+        "Einspeisevergütung Reststrombezug [kWh]",
+        "Einspeisevergütung Netzbezugskosten [€]",
+        "ES Reststrombezugskosten [€]", "ES Sharing-Bezugskosten [€]",
+        "Sharing [kWh]", "Netzbezug [kWh]",
+        "Ohne ES [€]", "Mit ES [€]", "Ersparnis [€]"
+    ]).set_index("Teilnehmer")
+    # Vergleich pro Prosumer: Referenz = Eigenverbrauch vor Einspeisung mit Vergütung.
+    # ES = statische Zuteilung; Restüberschuss wird physisch eingespeist, aber nicht vergütet.
+    prosumer_cost_rows = []
+    total_prosumer_savings = 0.0
+    for p in prosumers:
+        ref_own = np.minimum(generation[p], demand[p])
+        ref_grid = np.maximum(0.0, demand[p] - ref_own)
+        ref_feed = np.maximum(0.0, generation[p] - ref_own)
+        assert np.allclose(generation[p], ref_own + ref_feed), f"PV-Bilanzfehler bei Prosumer {p}"
+        assert np.allclose(demand[p], ref_own + ref_grid), f"Verbrauchsbilanzfehler bei Prosumer {p}"
+        ref_grid_cost = float(ref_grid.sum()) * prices["p_grid"]
+        ref_revenue = float(ref_feed.sum()) * prices["p_feed_in"]
+        es_grid_cost = float(grid[p].sum()) * prices["p_grid"]
+        es_revenue = float(sharing_out[p].sum()) * (prices["p_sharing"] + prices.get("p_bonus", 0.0))
+        # Ein Prosumer kann zusätzlich Strom von anderen Prosumern beziehen.
+        es_sharing_cost = float(sharing_in[p].sum()) * prices["p_sharing_consumer"]
+        ref_net = ref_grid_cost - ref_revenue
+        es_net = es_grid_cost + es_sharing_cost - es_revenue
+        total_prosumer_savings += ref_net - es_net
+        prosumer_cost_rows.append({
+            "Prosumer": f"Prosumer {p}",
+            "PV-Erzeugung [kWh]": float(generation[p].sum()),
+            "Eigenbedarf [kWh]": float(demand[p].sum()),
+            "Referenz Eigenverbrauch [kWh]": float(ref_own.sum()),
+            "Referenz Netzbezug [kWh]": float(ref_grid.sum()),
+            "Referenz Einspeisung [kWh]": float(ref_feed.sum()),
+            "ES Eigenverbrauch [kWh]": float(own[p].sum()),
+            "ES Sharing-Abgabe [kWh]": float(sharing_out[p].sum()),
+            "ES Sharing-Bezug [kWh]": float(sharing_in[p].sum()),
+            "ES Netzbezug [kWh]": float(grid[p].sum()),
+            "ES Unvergütete Einspeisung [kWh]": float(surplus[p].sum()),
+            "Referenz Netzbezugskosten [€]": ref_grid_cost,
+            "Referenz Einspeiseerlöse [€]": ref_revenue,
+            "Referenz Nettostromkosten [€]": ref_net,
+            "ES Netzbezugskosten [€]": es_grid_cost,
+            "ES Sharing-Bezugskosten [€]": es_sharing_cost,
+            "ES P2P-Erlöse [€]": float(sharing_out[p].sum()) * prices["p_sharing"],
+            "ES Sharing-Bonus [€]": float(sharing_out[p].sum()) * prices.get("p_bonus", 0.0),
+            "ES Restüberschuss-Erlöse [€]": 0.0,
+            "ES Nettostromkosten [€]": es_net,
+            "Vorteil ES [€]": ref_net - es_net
+        })
+    df_prosumer = pd.DataFrame(prosumer_cost_rows).set_index("Prosumer")
+    # Monatswerte für Kosten, Erlöse und Energiemengen (kWh / EUR)
+    monthly = pd.DataFrame(index=time)
+    monthly["Verbrauch [kWh]"] = sum(demand.values(), np.zeros(n))
+    monthly["PV-Erzeugung [kWh]"] = sum(generation.values(), np.zeros(n))
+    monthly["PV-Eigenverbrauch [kWh]"] = sum(own.values(), np.zeros(n))
+    monthly["Sharing [kWh]"] = sum(sharing_out.values(), np.zeros(n))
+    monthly["Restnetzbezug [kWh]"] = sum(grid.values(), np.zeros(n))
+    monthly["Unvergütete Einspeisung ES [kWh]"] = sum(surplus.values(), np.zeros(n))
+    monthly["P2P-Erlöse ES [€]"] = monthly["Sharing [kWh]"] * prices["p_sharing"]
+    monthly["Sharing-Bonus ES [€]"] = monthly["Sharing [kWh]"] * prices.get("p_bonus", 0.0)
+    monthly["Netzbezugskosten ES [€]"] = monthly["Restnetzbezug [kWh]"] * prices["p_grid"]
+    monthly["Sharing-Bezugskosten ES [€]"] = sum(sharing_in.values(), np.zeros(n)) * prices["p_sharing_consumer"]
+    monthly["Einspeiseerlöse Referenz [€]"] = sum(
+        (np.maximum(0, generation[p] - np.minimum(generation[p], demand[p])) for p in prosumers),
+        np.zeros(n)
+    ) * prices["p_feed_in"]
+    # Referenzmodell und ES-Modell als vollständige Monatsabrechnung.
+    # Referenz: kein Sharing, lokale PV-Nutzung zuerst, Überschuss mit Vergütung.
+    ref_grid_ts = sum(
+        (np.maximum(0.0, demand[h] - np.minimum(generation[h], demand[h]))
+         if h in prosumers else demand[h] for h in member_ids),
+        np.zeros(n)
     )
-
-    df_prosumer = pd.DataFrame({
-        "Ohne ES": {
-            "Netzbezugskosten": reference["grid_cost"],
-            "Vermarktungserlöse": reference["feed_in_revenue"],
-            "Nettostromkosten": reference["net_cost"]
-        },
-        "Mit ES": {
-            "Netzbezugskosten": sharing["grid_cost"],
-            "Vermarktungserlöse": revenue_sharing,
-            "Nettostromkosten": sharing["net_cost"]
-        }
-    })
-
-    df_prosumer["Veränderung"] = (
-        df_prosumer["Mit ES"] - df_prosumer["Ohne ES"]
+    monthly["Netzbezugskosten Referenz [€]"] = ref_grid_ts * prices["p_grid"]
+    monthly["Nettostromkosten Referenz [€]"] = (
+        monthly["Netzbezugskosten Referenz [€]"]
+        - monthly["Einspeiseerlöse Referenz [€]"]
     )
-
-    # --------------------------------------------------------
-    # Zahlungsbilanz
-    # --------------------------------------------------------
-
-    E_shared = shared.sum()
-
+    monthly["Nettostromkosten ES [€]"] = (
+        monthly["Netzbezugskosten ES [€]"]
+        + monthly["Sharing-Bezugskosten ES [€]"]
+        - monthly["P2P-Erlöse ES [€]"]
+        - monthly["Sharing-Bonus ES [€]"]
+    )
+    monthly["Vorteil ES [€]"] = (
+        monthly["Nettostromkosten Referenz [€]"]
+        - monthly["Nettostromkosten ES [€]"]
+    )
+    monthly = monthly.resample("MS").sum()
+    monthly.index = monthly.index.strftime("%Y-%m")
+    annual = monthly.sum(numeric_only=True).to_frame("Gesamtjahr 2025")
+    annual.index.name = "Kennzahl"
+    e_shared = float(sum(v.sum() for v in sharing_out.values()))
     components = {
         "Prosumer-Vergütung": prices["p_sharing"],
-        "Netzentgelte": prices["p_netzentgelte"],
-        "Umlagen und Abgaben": prices["p_umlagen_abgaben"],
-        "Stromsteuer": prices["p_stromsteuer"],
-        "Servicegebühr": prices["p_servicegebühr"]
+        "Netzentgelte (reduziert)": prices["p_network_paid"],
+        "Umlagen und Abgaben (nach Befreiung)": prices["p_levies_paid"],
+        "Elektrizitätsabgabe (nach Befreiung)": prices["p_tax_paid"],
+        "Servicegebühr": prices["p_servicegebühr"],
     }
-
     df_payments = pd.DataFrame([
-        {
-            "Bestandteil": name,
-            "Preis [ct/kWh]": price * 100,
-            "Betrag [€]": E_shared * price
-        }
+        {"Bestandteil": name, "Preis [ct/kWh]": price * 100,
+         "Betrag [€]": e_shared * price}
         for name, price in components.items()
     ]).set_index("Bestandteil")
-
-    # --------------------------------------------------------
-    # Kennzahlen und Bilanzkontrollen
-    # --------------------------------------------------------
-
-    E_generation = generation.sum()
-    E_self = self_pv.sum()
-    E_surplus = surplus.sum()
-
-    E_total_demand = (
-        total_consumer_demand
-        + sum(solver.consf(PROSUMER, t) for t in range(N))
-    )
-
-    E_total_grid = (
-        total_consumer_grid + grid_prosumer.sum()
-    )
-
-    E_local_pv = E_self + total_consumer_shared
-
-    autarky = (
-        100 * E_local_pv / E_total_demand
-        if E_total_demand > 0 else 0
-    )
-
-    pv_utilization = (
-        100 * E_local_pv / E_generation
-        if E_generation > 0 else 0
-    )
-
-    prosumer_savings = (
-        reference["net_cost"] - sharing["net_cost"]
-    )
-
-    community_benefit = (
-        prosumer_savings + total_consumer_savings
-    )
-
-    # Bilanzprüfungen über alle Zeitschritte
-    pv_error = np.max(np.abs(
-        generation - shared - self_pv - surplus
-    ))
-
-    # Summe der Sharing-Energie aller Consumer je Zeitschritt
-    consumer_sharing_ts = np.array([
-        [
-            solver.model.imported[c, t].value
-            for t in range(N)
-        ]
-        for c in CONSUMERS
-    ], dtype=float)
-
-    total_sharing_ts = consumer_sharing_ts.sum(axis=0)
-
-    # Maximale Abweichung über alle Zeitschritte
-    sharing_error = np.max(
-        np.abs(shared - total_sharing_ts)
-    )
-
-    payment_error = abs(
-        df_payments["Betrag [€]"].sum()
-        - E_shared * prices["p_sharing_consumer"]
-    )
-
-    # Ergebnisse unabhängig vom Solver zurückgeben
+    bonus_cost = e_shared * prices.get("p_bonus", 0.0)
+    network_relief = e_shared * prices["p_netzentgelte"] * prices["p_network_discount"]
+    levy_relief = e_shared * (prices["p_umlagen_abgaben"] - prices["p_levies_paid"])
+    tax_relief = e_shared * (prices["p_stromsteuer"] - prices["p_tax_paid"])
+    e_generation = float(sum(v.sum() for v in generation.values()))
+    e_self = float(sum(v.sum() for v in own.values()))
+    e_surplus = float(sum(v.sum() for v in surplus.values()))
+    e_grid = float(sum(v.sum() for v in grid.values()))
+    e_demand = float(sum(v.sum() for v in demand.values()))
+    pv_error = max(float(np.max(np.abs(generation[p] - own[p] - sharing_out[p] - surplus[p]))) for p in prosumers)
+    member_error = max(float(np.max(np.abs(demand[h] - own[h] - sharing_in[h] - grid[h]))) for h in member_ids)
+    sharing_error = float(np.max(np.abs(sum(sharing_out.values(), np.zeros(n)) - sum(sharing_in.values(), np.zeros(n)))))
+    payment_error = abs(float(df_payments["Betrag [€]"].sum()) - e_shared * prices["p_sharing_consumer"])
     return {
-        "timeseries": df_time,
-            "member_timeseries": member_timeseries,
-    "prosumer_pv_usage": {
-        PROSUMER: {
-            "Eigenverbrauch": float(self_pv.sum()),
-            "Energy Sharing": float(shared.sum()),
-            "Netzeinspeisung": float(surplus.sum())
-        }
-    },
-        "consumers": df_consumers,
-        "prosumer": df_prosumer,
-        "payments": df_payments,
-        "generation": E_generation,
-        "shared": E_shared,
-        "self": E_self,
-        "surplus": E_surplus,
-        "grid": E_total_grid,
-        "demand": E_total_demand,
-        "autarky": autarky,
-        "pv_utilization": pv_utilization,
-        "prosumer_savings": prosumer_savings,
+        "timeseries": df_time, "monthly": monthly, "annual": annual, "member_timeseries": member_timeseries,
+        "prosumer_pv_usage": pv_usage, "consumers": df_consumers,
+        "prosumer": df_prosumer, "payments": df_payments,
+        "generation": e_generation, "shared": e_shared, "self": e_self,
+        "surplus": e_surplus, "grid": e_grid, "demand": e_demand,
+        "autarky": 100 * (e_self + e_shared) / e_demand if e_demand else 0.0,
+        "pv_utilization": 100 * (e_self + e_shared) / e_generation if e_generation else 0.0,
+        "prosumer_savings": total_prosumer_savings,
         "consumer_savings": total_consumer_savings,
-        "community_benefit": community_benefit,
-        "checks": {
-            "PV-Bilanz": pv_error,
-            "Sharing-Bilanz (Tag)": sharing_error,
-            "Zahlungsbilanz": payment_error
-        },
+        "community_benefit": total_prosumer_savings + total_consumer_savings,
+        "external_bonus_cost": bonus_cost,
+        "network_relief": network_relief,
+        "levy_relief": levy_relief,
+        "tax_relief": tax_relief,
+        "checks": {"PV-Bilanz": pv_error, "Mitglieder-Bilanz": member_error,
+                   "Sharing-Bilanz": sharing_error, "Zahlungsbilanz": payment_error},
         "parameters": {
             "pv_capacities": pv_capacities.copy(),
-            "allocation_keys_by_prosumer": {
-                p: keys.copy()
-                for p, keys in allocation_keys_by_prosumer.items()
-            },
-            "prices": prices.copy(),
-            "N": N,
-            "DT": DT
-        }
+            "allocation_keys_by_prosumer": {p: keys.copy() for p, keys in allocation_keys_by_prosumer.items()},
+            "prices": prices.copy(), "N": n, "DT": DT,
+        },
     }
 
 
@@ -423,7 +360,12 @@ if "members_config" not in st.session_state:
         0: {
             "role": "prosumer",
             "pv_kwp": 5.0,
-            "allocation_keys": {1: 50.0, 2: 30.0, 3: 20.0}
+            "allocation_keys": {
+                0: 20.0,
+                1: 40.0,
+                2: 25.0,
+                3: 15.0
+            }
         },
         1: {
             "role": "consumer",
@@ -490,7 +432,7 @@ with st.sidebar:
 
         with st.expander(
             f"Mitglied {h} – {config['role'].capitalize()}",
-            expanded=(h == 0)
+            expanded=(config["role"] == "prosumer")
         ):
 
             # Rolle ändern
@@ -500,8 +442,7 @@ with st.sidebar:
                 index=(
                     1 if config["role"] == "prosumer" else 0
                 ),
-                key=f"role_{h}",
-                disabled=(h == 0)
+                key=f"role_{h}"
             )
 
             config["role"] = role
@@ -518,10 +459,7 @@ with st.sidebar:
 
                 st.markdown("**Aufteilungsschlüssel**")
 
-                recipients = [
-                    c for c in st.session_state.members_config
-                    if c != h
-                ]
+                recipients = list(st.session_state.members_config)
 
                 new_keys = {}
 
@@ -546,6 +484,13 @@ with st.sidebar:
 
                 total = sum(new_keys.values())
 
+                own_alpha = new_keys.get(h, 0.0)
+                st.caption(
+                    f"Eigener PV-Zuteilungsschlüssel: {own_alpha:.1f} %. "
+                    "Dies ist nicht der tatsächliche PV-Eigenverbrauch. "
+                    "Dieser wird durch das Verbrauchsprofil begrenzt."
+                )
+
                 if abs(total - 100.0) < 1e-6:
                     st.success("Aufteilung: 100 %")
                 else:
@@ -559,14 +504,11 @@ with st.sidebar:
                 config["allocation_keys"] = {}
 
             # Mitglied entfernen
-            if h != 0:
-
-                if st.button(
-                    "🗑️ Mitglied entfernen",
-                    key=f"remove_{h}"
-                ):
-                    del st.session_state.members_config[h]
-                    st.rerun()
+            if st.button(
+                "🗑️ Mitglied entfernen", key=f"remove_{h}"
+            ):
+                del st.session_state.members_config[h]
+                st.rerun()
 
     st.divider()
 
@@ -610,18 +552,37 @@ with st.sidebar:
 
     allocation_valid = allocation_valid and bool(PROSUMERS)
 
-    # AB HIER BLEIBT DEIN BESTEHENDER CODE:
-    st.subheader("Strompreise [€/kWh]")
+    # Vorläufiger statischer Zuteilungsanspruch; keine Solver-Ergebnisse.
+    # Der tatsächliche Eigenverbrauch hängt vom Verbrauchsprofil ab.
+    allocation_preview = []
+    for p in PROSUMERS:
+        cfg = st.session_state.members_config[p]
+        allocation_preview.append({
+            "Prosumer": p,
+            "PV-Leistung [kWp]": cfg["pv_kwp"],
+            "Eigener Schlüssel [%]": cfg["allocation_keys"].get(p, 0.0),
+            "Schlüssel anderer Mitglieder [%]": sum(
+                v for c, v in cfg["allocation_keys"].items() if c != p
+            )
+        })
 
-    st.subheader("Strompreise [€/kWh]")
+    # AB HIER BLEIBT DEIN BESTEHENDER CODE:
+    with st.expander("Aufteilungsschlüssel – Übersicht", expanded=False):
+        st.dataframe(pd.DataFrame(allocation_preview), hide_index=True)
+        st.caption("Zuteilungsansprüche, keine simulierten Energieflüsse.")
+
+    st.subheader("Preisparameter [€/kWh]")
+    st.caption("Konstante Tarifannahmen für das gesamte Jahr; Jahressummen werden aus den Energiemengen berechnet.")
 
     p_grid = st.number_input(
-        "Haushaltsstrompreis",
-        value=0.37,
+        "Endpreis für Endverbraucher (ohne Sharing) [€/kWh]",
+        value=0.32,
         min_value=0.0,
         step=0.01,
         format="%.3f"
     )
+
+    st.caption("Dieser Endpreis gilt für den Netz- bzw. Reststrombezug und wird nicht zusätzlich aus den untenstehenden Sharing-Tarifkomponenten berechnet.")
 
     p_sharing = st.number_input(
         "P2P-Vergütung",
@@ -648,8 +609,8 @@ with st.sidebar:
     )
 
     p_tax = st.number_input(
-        "Stromsteuer",
-        value=0.02,
+        "Elektrizitätsabgabe (Österreich 2025)",
+        value=0.015,
         min_value=0.0,
         step=0.01,
         format="%.3f"
@@ -664,30 +625,80 @@ with st.sidebar:
     )
 
     p_feed_in = st.number_input(
-        "Einspeisevergütung",
+        "Einspeisevergütung ohne Energy Sharing [€/kWh]",
         value=0.08,
         min_value=0.0,
         step=0.01,
         format="%.3f"
     )
 
-    p_residual = st.number_input(
-        "Restüberschussvergütung",
-        value=0.00,
-        min_value=0.0,
-        step=0.01,
-        format="%.3f"
+    st.divider()
+    st.subheader("Anreizmechanismen – Modelljahr 2025")
+    st.caption(
+        "Netznutzungsrabatte gelten ausschließlich für tatsächlich geteilte kWh, "
+        "nicht für Restnetzbezug oder Einspeisung und basieren auf der Gemeinschaftsform "
+        "(lokale ESC, regionale ESC und überregionale ESC). "
+        "Die Netzkomponente ist ein editierbarer Modelltarif, kein amtlicher regionaler Preis."
     )
-
-    p_es = (
-        p_sharing + p_network
-        + p_levies + p_tax + p_service
+    incentives_enabled = st.radio(
+        "Anreizmechanismen aktivieren?",
+        options=[True, False],
+        format_func=lambda enabled: "Ja – Energy Sharing mit zusätzlichen Anreizen" if enabled
+            else "Nein – Energy Sharing ohne zusätzliche Anreize",
+        horizontal=True,
+        help="Bei Nein bleiben P2P-Vergütung und Sharing bestehen, aber es gelten "
+             "keine Netznutzungsrabatte, keine EEG-Abgabenbefreiungen und kein Sharing-Bonus."
     )
-
-    st.metric(
-        "Sharing-Endpreis",
-        f"{p_es:.3f} €/kWh"
+    at_model = st.selectbox(
+        "Netzgebiet / Gemeinschaftsform",
+        list(AT_NETWORK_DISCOUNTS),
+        index=1,
+        disabled=not incentives_enabled,
     )
+    at_discount = AT_NETWORK_DISCOUNTS[at_model] if incentives_enabled else 0.0
+    at_eeg = at_model.startswith("EEG") if incentives_enabled else False
+    p_renewable_contribution = st.number_input(
+        "Erneuerbaren-Förderbeitrag innerhalb der Umlagen [€/kWh]",
+        min_value=0.0, max_value=float(p_levies), value=min(0.00796, float(p_levies)),
+        step=0.0001, format="%.5f", disabled=not incentives_enabled,
+        help="Modellannahme für den variablen Förderbeitrag; keine vollständige Tarifabrechnung."
+    )
+    bonus_input = st.number_input(
+        "Hypothetischer Sharing-Bonus für Prosumer [€/geteilter kWh]",
+        value=0.0, min_value=0.0, step=0.01, format="%.3f",
+        disabled=not incentives_enabled,
+        help="Kein allgemeiner gesetzlicher österreichischer Sharing-Bonus. "
+             "Externer Fördertopf; Standard 0."
+    )
+    p_bonus = bonus_input if incentives_enabled else 0.0
+    at_tariff = sharing_tariff(
+        p_sharing, p_network, p_levies, p_tax, p_service,
+        at_discount, at_eeg, p_renewable_contribution, p_bonus
+    )
+    p_es = at_tariff["p_sharing_consumer"]
+    # Der Endpreis ist ein berechneter Tarif, kein zusätzlicher Kostenbestandteil.
+    st.metric("Endpreis für Endverbraucher (Sharing)", f"{p_es:.3f} €/kWh")
+    st.caption(
+        f"Berechnung: P2P {p_sharing:.3f} + Netz {at_tariff['p_network_paid']:.3f} "
+        f"+ Umlagen {at_tariff['p_levies_paid']:.3f} "
+        f"+ Elektrizitätsabgabe {at_tariff['p_tax_paid']:.3f} "
+        f"+ Service {p_service:.3f} = {p_es:.3f} €/kWh. "
+        f"Zum Vergleich: Restnetzbezug {p_grid:.3f} €/kWh."
+    )
+    if incentives_enabled:
+        st.caption(
+            f"Netznutzungsrabatt: {at_discount:.0%}. "
+            + ("EEG: Elektrizitätsabgabe und modellierter Erneuerbaren-Förderbeitrag "
+               "auf Sharing-Bezug entfallen."
+               if at_eeg else "Keine EEG-Abgabenbefreiung.")
+        )
+    else:
+        st.info(
+            "Ohne Anreize: 0 % Netznutzungsrabatt, keine Befreiung von Abgaben "
+            "und 0 €/kWh Sharing-Bonus. Energy Sharing und P2P-Zahlungen bleiben aktiv."
+        )
+    p_residual = 0.0
+    st.caption("Nicht geteilter PV-Restüberschuss wird im ES-Modell weiterhin unvergütet eingespeist (bestehende Modellannahme).")
 
     st.divider()
 
@@ -701,9 +712,6 @@ with st.sidebar:
 # 4. SIMULATION AUSFÜHREN
 # ============================================================
 
-# Für den bisherigen Single-Prosumer-Solver
-allocation_keys = allocation_keys_by_prosumer.get(0, {})
-
 prices = {
     "p_grid": p_grid,
     "p_sharing": p_sharing,
@@ -713,7 +721,8 @@ prices = {
     "p_servicegebühr": p_service,
     "p_feed_in": p_feed_in,
     "p_residual": p_residual,
-    "p_sharing_consumer": p_es
+    "p_sharing_consumer": p_es,
+    **at_tariff
 }
 
 if run_button:
@@ -721,25 +730,14 @@ if run_button:
     if not allocation_valid:
         st.error("Bitte die Aufteilungsschlüssel korrigieren.")
 
-    elif set(MEMBERS) != set(AVAILABLE_MEMBERS):
-        st.warning(
-            "Das Entfernen von Mitgliedern ist in der Oberfläche "
-            "vorbereitet, aber noch nicht mit dem Solver verbunden."
-        )
-
-    elif PROSUMERS != [0]:
-        st.warning(
-            "Mehrere Prosumer werden erst nach der "
-            "Erweiterung des Solvers unterstützt."
-        )
-
     else:
         try:
             with st.spinner("Optimierung wird durchgeführt..."):
                 results = run_simulation(
-                    allocation_keys_by_prosumer[0],
+                    allocation_keys_by_prosumer,
                     prices,
-                    pv_capacities
+                    pv_capacities,
+                    st.session_state.members_config
                 )
 
             st.session_state["results"] = results
@@ -795,11 +793,12 @@ else:
             "den aktuellen Modellparametern."
         )
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "⚡ Energiebilanz",
         "💶 Wirtschaftlichkeit",
         "🔍 Modellkontrolle",
-        "⚙️ Simulationsparameter"
+        "⚙️ Simulationsparameter",
+        "🎯 Anreizmechanismen"
     ])
 
     # --------------------------------------------------------
@@ -832,6 +831,15 @@ else:
         st.divider()
 
         st.subheader("Zeitlicher Verlauf")
+        if len(r["timeseries"]) < 35040:
+            st.warning(
+                f"Die Eingabedaten enthalten {len(r['timeseries']):,} Viertelstundenwerte "
+                "statt 35.040 für ein vollständiges Jahr. "
+                "Bitte ersetze data_test/cons.csv, sun.csv und price.csv durch echte Jahresprofile "
+                "(35.040 Werte, ohne Kopfzeile). Bis dahin wird nur der vorhandene Zeitraum gezeigt."
+            )
+        else:
+            st.caption("Synthetisches Modelljahr 2025 – 35.040 Viertelstundenwerte; Zoom im Diagramm möglich.")
 
         member_data = r["member_timeseries"]
         member_ids = sorted(member_data.keys())
@@ -854,7 +862,6 @@ else:
                     "Verbrauchsprofil",
                     "PV-Erzeugungsprofil",
                     "PV-Eigenverbrauchsprofil",
-                    "Eigenverbrauch",
                     "Sharing-Bezug",
                     "Sharing-Abgabe",
                     "Reststrombezug"
@@ -881,22 +888,35 @@ else:
                 # Reststrom aus dem öffentlichen Netz
                 df_selected["Reststrombezug"] += data_h["Netzbezug"]
 
+            view = st.radio(
+                "Zeitauflösung",
+                ["Monatssummen", "Tagessummen", "15 Minuten"],
+                horizontal=True,
+                key="energy_time_resolution"
+            )
+            if view == "Monatssummen":
+                df_plot = df_selected.resample("MS").sum()
+                unit = "Energie pro Monat [kWh]"
+            elif view == "Tagessummen":
+                df_plot = df_selected.resample("D").sum()
+                unit = "Energie pro Tag [kWh]"
+            else:
+                df_plot = df_selected
+                unit = "Energie je 15 Minuten [kWh]"
+
             fig = px.line(
-                df_selected,
-                x=df_selected.index,
-                y=df_selected.columns,
+                df_plot,
+                x=df_plot.index,
+                y=df_plot.columns,
                 labels={
                     "x": "Uhrzeit",
-                    "value": "Energie je 15 Minuten [kWh]",
+                    "value": unit,
                     "variable": "Energiefluss"
                 }
             )
 
-            fig.update_xaxes(
-                tickformat="%H:%M",
-                dtick=2 * 60 * 60 * 1000,
-                title="Uhrzeit"
-            )
+            fig.update_xaxes(tickformat="%d.%m.%Y", title="Datum")
+            fig.update_layout(xaxis_rangeslider_visible=True)
 
             fig.update_layout(
                 hovermode="x unified",
@@ -911,84 +931,96 @@ else:
         else:
             st.info("Bitte mindestens ein ESC-Mitglied auswählen.")
 
-        st.subheader("Verwendung der PV-Erzeugung")
+        st.subheader("PV-Erzeugung: Vergleich der Vermarktungsszenarien")
+        st.caption(
+            "Zwei alternative Szenarien für dieselbe PV-Erzeugung. "
+            "Jeder Balken stellt eine vollständige, eigenständige Jahresbilanz dar; "
+            "die Balken dürfen nicht addiert werden."
+        )
 
-        pv_usage = r["prosumer_pv_usage"]
-        prosumer_ids = sorted(pv_usage.keys())
-
-        prosumer_options = ["Alle Prosumer"] + [
-            f"Prosumer {p}" for p in prosumer_ids
-        ]
-
+        prosumer_df = r["prosumer"]
+        prosumer_options = ["Alle Prosumer"] + list(prosumer_df.index)
         selected_prosumer = st.selectbox(
             "Prosumer auswählen",
             options=prosumer_options,
             index=0,
             key="chart_selected_prosumer"
         )
-
         if selected_prosumer == "Alle Prosumer":
-            selected_prosumers = prosumer_ids
+            selected_rows = prosumer_df
         else:
-            selected_prosumers = [
-                int(selected_prosumer.split()[-1])
-            ]
+            selected_rows = prosumer_df.loc[[selected_prosumer]]
 
-        labels = [
-            f"Prosumer {p}"
-            for p in selected_prosumers
+        scenario_charts = [
+            (
+                "Einspeisevergütung (ohne Energy Sharing)",
+                [
+                    ("PV-Eigenverbrauch", "Referenz Eigenverbrauch [kWh]", "#2E86AB"),
+                    ("Vergütete Netzeinspeisung", "Referenz Einspeisung [kWh]", "#7CB342"),
+                ],
+            ),
+            (
+                "Energy Sharing (ohne Restüberschussvergütung)",
+                [
+                    ("PV-Eigenverbrauch", "ES Eigenverbrauch [kWh]", "#2E86AB"),
+                    ("Sharing-Abgabe", "ES Sharing-Abgabe [kWh]", "#F4A261"),
+                    ("Unvergütete Netzeinspeisung", "ES Unvergütete Einspeisung [kWh]", "#A0A0A0"),
+                ],
+            ),
         ]
-
-        fig = go.Figure()
-
-        colors = {
-            "Eigenverbrauch": "#2E86AB",
-            "Energy Sharing": "#F4A261",
-            "Netzeinspeisung": "#7CB342"
-        }
-
-        for category in [
-            "Eigenverbrauch",
-            "Energy Sharing",
-            "Netzeinspeisung"
-        ]:
-
-            values = [
-                pv_usage[p][category]
-                for p in selected_prosumers
-            ]
-
-            fig.add_trace(
-                go.Bar(
-                    name=category,
-                    y=labels,
-                    x=values,
-                    orientation="h",
-                    marker_color=colors[category],
-                    hovertemplate=(
-                        "%{y}<br>"
-                        + category
-                        + ": %{x:.2f} kWh"
-                        + "<extra></extra>"
-                    )
+        # Gemeinsame Skala: Ein Balken je Prosumer und Szenario entspricht
+        # der jeweiligen gesamten PV-Erzeugung (kWh/Jahr).
+        max_generation = max(float(selected_rows["PV-Erzeugung [kWh]"].max()), 1.0)
+        chart_cols = st.columns(2)
+        for col, (scenario_title, components) in zip(chart_cols, scenario_charts):
+            with col:
+                st.markdown(f"**{scenario_title}**")
+                fig = go.Figure()
+                for label, column, color in components:
+                    fig.add_trace(go.Bar(
+                        name=label,
+                        y=list(selected_rows.index),
+                        x=selected_rows[column].tolist(),
+                        orientation="h",
+                        marker_color=color,
+                        hovertemplate=(
+                            "%{y}<br>" + label + ": %{x:,.2f} kWh"
+                            + "<extra></extra>"
+                        ),
+                    ))
+                fig.update_layout(
+                    barmode="stack",
+                    xaxis=dict(title="PV-Erzeugung [kWh/Jahr]", range=[0, max_generation * 1.08]),
+                    yaxis=dict(title="", autorange="reversed"),
+                    legend=dict(orientation="h", y=-0.25, x=0),
+                    height=max(370, 95 * len(selected_rows) + 200),
+                    margin=dict(l=10, r=10, t=15, b=80),
                 )
-            )
+                st.plotly_chart(fig, use_container_width=True)
 
-        fig.update_layout(
-            barmode="stack",
-            xaxis_title="Energie [kWh]",
-            yaxis_title="",
-            legend_title="Verwendung",
-            height=max(300, 100 * len(selected_prosumers)),
-            margin=dict(l=20, r=20, t=20, b=20)
+        st.caption(
+            "Bilanzprüfung je Prosumer: PV-Erzeugung = PV-Eigenverbrauch + "
+            "vergütete Einspeisung (Einspeisevergütung) beziehungsweise "
+            "PV-Eigenverbrauch + Sharing-Abgabe + unvergütete Einspeisung (Energy Sharing)."
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
+        st.subheader("Jahresbilanz 2025 – Energie und Kosten")
+        st.dataframe(r["annual"].style.format("{:.2f}"), use_container_width=True)
+        st.download_button(
+            "Jahresbilanz als CSV herunterladen",
+            data=r["annual"].to_csv().encode("utf-8-sig"),
+            file_name="energy_sharing_jahresbilanz_2025.csv", mime="text/csv"
         )
 
-        st.subheader("Energiebilanz der Consumer")
+        st.subheader("Monatliche Energie- und Zahlungsbilanz")
+        st.dataframe(r["monthly"].style.format("{:.2f}"), use_container_width=True)
+        st.download_button(
+            "Monatswerte als CSV herunterladen",
+            data=r["monthly"].to_csv().encode("utf-8"),
+            file_name="energy_sharing_monatswerte_2025.csv", mime="text/csv"
+        )
+
+        st.subheader("Energiebilanz der Consumer – Gesamtjahr 2025")
 
         st.dataframe(
             r["consumers"][[
@@ -999,7 +1031,7 @@ else:
             use_container_width=True
         )
 
-        st.subheader("Energiebilanz der Gemeinschaft")
+        st.subheader("Energiebilanz der Gemeinschaft – Gesamtjahr 2025")
 
         df_total = pd.DataFrame({
             "Energie [kWh]": {
@@ -1023,7 +1055,8 @@ else:
 
     with tab2:
 
-        st.subheader("Wirtschaftlicher Vergleich")
+        st.subheader("Wirtschaftlicher Vergleich – Gesamtjahr 2025")
+        st.caption("Alle Euro-Beträge sind Jahressummen aus 35.040 Viertelstunden. Tarife sind konstante Annahmen, keine Börsenpreise.")
 
         c1, c2, c3 = st.columns(3)
 
@@ -1044,25 +1077,103 @@ else:
 
         st.divider()
 
-        st.subheader("Prosumer")
+        st.subheader("Prosumer – Vergleich der Vermarktungsmodelle")
+        st.caption("PV-Eigenverbrauch bedeutet Deckung durch die eigene PV-Anlage. Eigener Strombedarf umfasst PV-Eigenverbrauch, Sharing-Bezug und Reststrombezug.")
 
-        st.dataframe(
-            r["prosumer"].style.format("{:.2f} €"),
-            use_container_width=True
-        )
+        for prosumer_id, row in r["prosumer"].iterrows():
+            st.markdown(f"#### {prosumer_id}")
+            prosumer_energy = pd.DataFrame({
+                "Einspeisevergütung": {
+                    "PV-Erzeugung": row["PV-Erzeugung [kWh]"],
+                    "Eigener Strombedarf": row["Eigenbedarf [kWh]"],
+                    "Davon: PV-Eigenverbrauch (eigene PV)": row["Referenz Eigenverbrauch [kWh]"],
+                    "Davon: Sharing-Bezug": 0.0,
+                    "Davon: Reststrombezug (Netz)": row["Referenz Netzbezug [kWh]"],
+                    "Sharing-Abgabe an andere Mitglieder": 0.0,
+                    "PV-Netzeinspeisung": row["Referenz Einspeisung [kWh]"],
+                },
+                "Energy Sharing": {
+                    "PV-Erzeugung": row["PV-Erzeugung [kWh]"],
+                    "Eigener Strombedarf": row["Eigenbedarf [kWh]"],
+                    "Davon: PV-Eigenverbrauch (eigene PV)": row["ES Eigenverbrauch [kWh]"],
+                    "Davon: Sharing-Bezug": row["ES Sharing-Bezug [kWh]"],
+                    "Davon: Reststrombezug (Netz)": row["ES Netzbezug [kWh]"],
+                    "Sharing-Abgabe an andere Mitglieder": row["ES Sharing-Abgabe [kWh]"],
+                    "PV-Netzeinspeisung": row["ES Unvergütete Einspeisung [kWh]"],
+                },
+            })
+            st.markdown("**Energiebilanz [kWh/Jahr]**")
+            st.dataframe(prosumer_energy.style.format("{:,.2f}"), use_container_width=True)
 
-        st.subheader("Consumer")
+            prosumer_costs = pd.DataFrame({
+                "Einspeisevergütung": {
+                    "Reststrombezugskosten": row["Referenz Netzbezugskosten [€]"],
+                    "Sharing-Bezugskosten": 0.0,
+                    "Einspeiseerlöse": row["Referenz Einspeiseerlöse [€]"],
+                    "P2P-Erlöse": 0.0,
+                    "Nettostromkosten": row["Referenz Nettostromkosten [€]"],
+                },
+                "Energy Sharing": {
+                    "Reststrombezugskosten": row["ES Netzbezugskosten [€]"],
+                    "Sharing-Bezugskosten": row["ES Sharing-Bezugskosten [€]"],
+                    "Einspeiseerlöse": row["ES Restüberschuss-Erlöse [€]"],
+                    "P2P-Erlöse": row["ES P2P-Erlöse [€]"],
+                    "Hypothetischer Sharing-Bonus": row["ES Sharing-Bonus [€]"],
+                    "Nettostromkosten": row["ES Nettostromkosten [€]"],
+                },
+            })
+            st.markdown("**Wirtschaftlichkeit [€/Jahr]**")
+            st.dataframe(prosumer_costs.style.format("{:,.2f} €"), use_container_width=True)
+            st.metric("Vorteil durch Energy Sharing gegenüber Einspeisevergütung", f"{row['Vorteil ES [€]']:+,.2f} €")
+            st.divider()
 
-        st.dataframe(
-            r["consumers"][[
-                "Ohne ES [€]",
-                "Mit ES [€]",
-                "Ersparnis [€]"
-            ]].style.format("{:.2f} €"),
-            use_container_width=True
-        )
+        st.subheader("Consumer – Vergleich der Versorgungsmodelle")
+        st.caption("Consumer besitzen keine eigene PV-Anlage. Ihr Strombedarf wird ohne Energy Sharing vollständig durch Reststrom aus dem Netz gedeckt; mit Energy Sharing teilweise durch Sharing-Bezug.")
 
-        st.subheader("Zahlungsbilanz Energy Sharing")
+        for consumer_id, row in r["consumers"].iterrows():
+            st.markdown(f"#### {consumer_id}")
+            consumer_energy = pd.DataFrame({
+                "Einspeisevergütung (ohne Sharing)": {
+                    "Eigener Strombedarf": row["Verbrauch [kWh]"],
+                    "Davon: PV-Eigenverbrauch (eigene PV)": 0.0,
+                    "Davon: Sharing-Bezug": 0.0,
+                    "Davon: Reststrombezug (Netz)": row["Einspeisevergütung Reststrombezug [kWh]"],
+                },
+                "Energy Sharing": {
+                    "Eigener Strombedarf": row["Verbrauch [kWh]"],
+                    "Davon: PV-Eigenverbrauch (eigene PV)": row["PV-Eigenverbrauch [kWh]"],
+                    "Davon: Sharing-Bezug": row["Sharing-Bezug [kWh]"],
+                    "Davon: Reststrombezug (Netz)": row["Reststrombezug [kWh]"],
+                },
+            })
+            st.markdown("**Energiebilanz [kWh/Jahr]**")
+            st.dataframe(consumer_energy.style.format("{:,.2f}"), use_container_width=True)
+
+            consumer_costs = pd.DataFrame({
+                "Einspeisevergütung (ohne Sharing)": {
+                    "Reststrombezugskosten": row["Einspeisevergütung Netzbezugskosten [€]"],
+                    "Sharing-Bezugskosten": 0.0,
+                    "Nettostromkosten": row["Ohne ES [€]"],
+                },
+                "Energy Sharing": {
+                    "Reststrombezugskosten": row["ES Reststrombezugskosten [€]"],
+                    "Sharing-Bezugskosten": row["ES Sharing-Bezugskosten [€]"],
+                    "Nettostromkosten": row["Mit ES [€]"],
+                },
+            })
+            st.markdown("**Wirtschaftlichkeit [€/Jahr]**")
+            st.dataframe(consumer_costs.style.format("{:,.2f} €"), use_container_width=True)
+            st.metric("Ersparnis durch Energy Sharing", f"{row['Ersparnis [€]']:+,.2f} €")
+            st.divider()
+
+        st.subheader("Monatlicher Kostenvergleich – 2025")
+        monthly_costs = r["monthly"][[
+            "Nettostromkosten Referenz [€]", "Nettostromkosten ES [€]"
+        ]]
+        st.line_chart(monthly_costs)
+        st.caption("Monatssummen der Haushalts-Nettostromkosten; die Jahreswerte stehen in den Tabellen oben.")
+
+        st.subheader("Zahlungsbilanz Energy Sharing – Gesamtjahr 2025")
 
         st.dataframe(
             r["payments"].style.format({
@@ -1172,7 +1283,7 @@ else:
         st.subheader("Strompreise")
 
         price_names = {
-            "p_grid": "Haushaltsstrompreis",
+            "p_grid": "Endpreis ohne Sharing",
             "p_sharing": "P2P-Vergütung",
             "p_sharing_consumer": "Sharing-Endpreis",
             "p_netzentgelte": "Netzentgelte",
@@ -1180,7 +1291,13 @@ else:
             "p_stromsteuer": "Stromsteuer",
             "p_servicegebühr": "Servicegebühr",
             "p_feed_in": "Einspeisevergütung",
-            "p_residual": "Restüberschussvergütung"
+            "p_residual": "Restüberschussvergütung",
+            "p_bonus": "Hypothetischer Sharing-Bonus",
+            "p_network_discount": "Netznutzungsrabatt (Anteil)",
+            "p_network_paid": "Netznutzungsentgelt nach Rabatt",
+            "p_levies_paid": "Umlagen nach Befreiung",
+            "p_tax_paid": "Elektrizitätsabgabe nach Befreiung",
+            "p_renewable_contribution": "Erneuerbaren-Förderbeitrag (Modellannahme)"
         }
 
         df_prices = pd.DataFrame([
@@ -1188,7 +1305,7 @@ else:
                 "Preisbestandteil": price_names.get(key, key),
                 "Preis [ct/kWh]": value * 100
             }
-            for key, value in params["prices"].items()
+            for key, value in params["prices"].items() if isinstance(value, (int, float)) and not isinstance(value, bool)
         ])
 
         st.dataframe(
@@ -1198,3 +1315,153 @@ else:
             hide_index=True,
             use_container_width=True
         )
+    # --------------------------------------------------------
+    # TAB 5: ANREIZMECHANISMEN / SENSITIVITÄT
+    # --------------------------------------------------------
+    with tab5:
+        st.subheader("Anreizmechanismen – Modelljahr 2025")
+        st.caption("Die Energiemengen sind bei dieser Preissensitivität fix. Verglichen wird jeweils mit Einspeisevergütung ohne Sharing; alle Werte in €/Jahr.")
+        st.caption("Aktive Anreizmechanismen: " + ("Ja" if incentives_enabled else "Nein") +
+                   ". Die folgenden Sensitivitäten zeigen hypothetische Alternativen und ändern nicht die aktuelle Simulation.")
+        pp = r["parameters"]["prices"]
+        total_shared = r["shared"]
+        total_bonus = r["external_bonus_cost"]
+        st.markdown("### Regulatorische Entlastungen und zusätzliche Förderungen – Jahresbilanz")
+        st.caption(
+            "Die Beträge beziehen sich auf die tatsächlich innerhalb der Gemeinschaft "
+            "geteilten und verbrauchten kWh des Modelljahres 2025. "
+            "Regulatorische Entlastungen senken die Kosten der Sharing-Bezieher; "
+            "der optionale Sharing-Bonus ist eine zusätzliche externe Zahlung an Prosumer."
+        )
+        st.metric("Tatsächlich geteilte Energie", f"{total_shared:,.0f} kWh/Jahr")
+        st.caption(f"Gewählte Gemeinschaftsform: {at_model if incentives_enabled else 'Ohne zusätzliche Anreize'}")
+
+        # Die regulatorischen Entlastungen sind keine direkte Auszahlung.
+        # Alle Beträge werden nur auf tatsächlich geteilte Energie angewandt.
+        network_relief = float(r["network_relief"])
+        levy_relief = float(r["levy_relief"])
+        tax_relief = float(r["tax_relief"])
+        bonus_cost = float(total_bonus)
+        regulatory_relief = network_relief + levy_relief + tax_relief
+        combined_effect = regulatory_relief + bonus_cost
+        per_kwh_factor = 100.0 / total_shared if total_shared > 0 else 0.0
+
+        st.markdown("**A. Regulatorische Entlastungen (Vorteil für Sharing-Bezieher)**")
+        relief_table = pd.DataFrame({
+            "Entlastung": [
+                "Reduziertes Netznutzungsentgelt",
+                "Entfall modellierter Erneuerbaren-Förderbeitrag",
+                "Entfall Elektrizitätsabgabe",
+                "Summe regulatorischer Entlastungen",
+            ],
+            "Angewandte Entlastung [ct/kWh]": [
+                pp["p_netzentgelte"] * pp["p_network_discount"] * 100,
+                (pp["p_umlagen_abgaben"] - pp["p_levies_paid"]) * 100,
+                (pp["p_stromsteuer"] - pp["p_tax_paid"]) * 100,
+                regulatory_relief * per_kwh_factor,
+            ],
+            "Jahresbetrag [€]": [network_relief, levy_relief, tax_relief, regulatory_relief],
+        })
+        st.dataframe(
+            relief_table.style.format({
+                "Angewandte Entlastung [ct/kWh]": "{:.3f}",
+                "Jahresbetrag [€]": "{:,.2f}",
+            }),
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(
+            "Netznutzungsentlastung = geteilte kWh × Netzarbeitspreis × Rabatt. "
+            "Abgabenentlastungen = geteilte kWh × jeweils entfallender Modelltarif. "
+            "Die regulären Netzentgelte und Abgaben für Reststrombezug bleiben unverändert."
+        )
+
+        st.markdown("**B. Zusätzliche externe Förderung (Vorteil für Prosumer)**")
+        funding_table = pd.DataFrame({
+            "Förderung": ["Hypothetischer Sharing-Bonus"],
+            "Fördersatz [ct/kWh]": [pp["p_bonus"] * 100],
+            "Externe Förderkosten [€/Jahr]": [bonus_cost],
+        })
+        st.dataframe(
+            funding_table.style.format({
+                "Fördersatz [ct/kWh]": "{:.3f}",
+                "Externe Förderkosten [€/Jahr]": "{:,.2f}",
+            }),
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(
+            "Bonus = tatsächlich geteilte kWh × Bonus je kWh. "
+            "Dieser Bonus ist eine frei wählbare Modellannahme und keine pauschale "
+            "gesetzliche österreichische Förderung."
+        )
+
+        st.markdown("**C. Zusammenfassung und wirtschaftliche Einordnung**")
+        summary_table = pd.DataFrame({
+            "Kennzahl": [
+                "Regulatorische Entlastungen gesamt",
+                "Zusätzliche externe Förderkosten",
+                "Entlastungen und Förderungen zusammen",
+                "Gesamter wirtschaftlicher Vorteil der Mitglieder gegenüber Einspeisevergütung",
+            ],
+            "Wert [€/Jahr]": [
+                regulatory_relief, bonus_cost, combined_effect, float(r["community_benefit"]),
+            ],
+        })
+        st.dataframe(
+            summary_table.style.format({"Wert [€/Jahr]": "{:,.2f}"}),
+            hide_index=True, use_container_width=True,
+        )
+        st.info(
+            "Die Summe aus Entlastungen und Förderungen ist **nicht** mit dem wirtschaftlichen "
+            "Vorteil der Gemeinschaft gleichzusetzen: Dieser berücksichtigt zusätzlich "
+            "Eigenverbrauch, Netzbezug, P2P-Zahlungen und entgangene Einspeiseerlöse. "
+            "P2P-Zahlungen sind zunächst interne Transfers zwischen Mitgliedern. "
+            "Entlastungen sind verminderte Tarifzahlungen, nicht automatisch direkte "
+            "Ausgaben eines Fördergebers."
+        )
+        if total_shared <= 0:
+            st.warning("Es wurde keine Energie geteilt; daher sind alle kWh-bezogenen Entlastungen null.")
+        if not incentives_enabled:
+            st.caption("Anreizmechanismen deaktiviert: Alle regulatorischen Entlastungen und der externe Bonus betragen 0 €.")
+
+        st.markdown("**Sensitivität des P2P-Preises**")
+        p2p_values = np.linspace(0.04, 0.25, 22)
+        base_p2p = pp["p_sharing"]
+        sensitivity = pd.DataFrame({
+            "P2P-Preis [ct/kWh]": p2p_values * 100,
+            "Prosumer-Vorteil [€/Jahr]": r["prosumer_savings"] + (p2p_values - base_p2p) * total_shared,
+            "Consumer-Vorteil [€/Jahr]": r["consumer_savings"] - (p2p_values - base_p2p) * total_shared,
+        }).set_index("P2P-Preis [ct/kWh]")
+        sensitivity["Gemeinschaftsvorteil [€/Jahr]"] = sensitivity.sum(axis=1)
+        st.line_chart(sensitivity)
+        st.caption("Der P2P-Preis verschiebt den Vorteil zwischen Prosumern und Consumern. Bei fixen Energiemengen bleibt die Summe unverändert.")
+        st.markdown("**Vergleich österreichischer Netzentgeltmodelle**")
+        comparisons = []
+        for name, discount in AT_NETWORK_DISCOUNTS.items():
+            eeg = name.startswith("EEG")
+            scenario_tariff = sharing_tariff(
+                pp["p_sharing"], pp["p_netzentgelte"], pp["p_umlagen_abgaben"],
+                pp["p_stromsteuer"], pp["p_servicegebühr"], discount, eeg,
+                pp["p_renewable_contribution"], pp["p_bonus"]
+            )
+            consumer_delta = (pp["p_sharing_consumer"] - scenario_tariff["p_sharing_consumer"]) * total_shared
+            comparisons.append({
+                "Gemeinschaftsform": name,
+                "Netzentgeltreduktion [%]": discount * 100,
+                "Sharing-Endpreis [ct/kWh]": scenario_tariff["p_sharing_consumer"] * 100,
+                "Prosumer-Vorteil [€/Jahr]": r["prosumer_savings"],
+                "Consumer-Vorteil [€/Jahr]": r["consumer_savings"] + consumer_delta,
+                "Gemeinschaftsvorteil [€/Jahr]": r["community_benefit"] + consumer_delta,
+            })
+        comparison_df = pd.DataFrame(comparisons).set_index("Gemeinschaftsform")
+        st.dataframe(comparison_df.style.format("{:,.2f}"), use_container_width=True)
+        st.caption("Vereinfachter Vergleich bei identischer PV-Zuteilung. Tarifbestandteile und Netznutzungsentgelt müssen für einen realen österreichischen Netzbetreiber konkretisiert werden.")
+        st.markdown("**Hypothetischer externer Sharing-Bonus**")
+        bonus_values = np.linspace(0, 0.10, 11)
+        bonus_sens = pd.DataFrame({
+            "Bonus [ct/kWh]": bonus_values * 100,
+            "Prosumer-Vorteil [€/Jahr]": r["prosumer_savings"] + (bonus_values - pp["p_bonus"]) * total_shared,
+            "Consumer-Vorteil [€/Jahr]": np.full(len(bonus_values), r["consumer_savings"]),
+            "Externe Bonuskosten [€/Jahr]": bonus_values * total_shared,
+        }).set_index("Bonus [ct/kWh]")
+        st.line_chart(bonus_sens)
+        st.caption("Forschungs-Szenario, keine bestehende pauschale österreichische Förderung.")
