@@ -75,34 +75,28 @@ DT = 0.25
 # Österreichische EEG: 2025 geltende, arbeitsbezogene Netznutzungsrabatte.
 # Die Rabatte beziehen sich nur auf die Netzkomponente des Sharing-Bezugs.
 AT_NETWORK_DISCOUNTS = {
-    "Keine Vergünstigung / BEG österreichweit": 0.0,
-    "EEG lokal (NE 6/7)": 0.57,
-    "EEG regional (NE 6/7)": 0.28,
-    "EEG regional (NE 4/5)": 0.64,
+    "Keine Vergünstigung / überregional": 0.0,
+    "Lokale ESC (AT-Vorbild, NE 6/7)": 0.57,
+    "Regionale ESC (AT-Vorbild, NE 6/7)": 0.28,
+    "Regionale ESC (AT-Vorbild, NE 4/5)": 0.64,
 }
 
 
 def sharing_tariff(p2p, network, levies, electricity_tax, service,
-                   discount, eeg_exempt, renewable_contribution, bonus):
-    """Geteilte kWh: P2P + reduzierte Netzarbeit + ggf. Abgaben + Service.
+                   discount, bonus):
+    """Deutsche Preisbestandteile; nur Netznutzungsrabatt nach AT-Vorbild.
 
-    Bonus ist ein externer, hypothetischer Zuschuss an den Erzeuger.
-    Er wird NICHT als Kostenbestandteil dem Consumer zugeschlagen.
+    Der Rabatt ist ein hypothetisches deutsches Szenario, keine geltende
+    deutsche Netzentgeltregelung. Der Bonus wird extern finanziert.
     """
     network_paid = network * (1.0 - discount)
-    levies_paid = levies - (renewable_contribution if eeg_exempt else 0.0)
-    if levies_paid < -1e-9:
-        raise ValueError("Erneuerbaren-Förderbeitrag übersteigt Umlagen und Abgaben.")
-    tax_paid = 0.0 if eeg_exempt else electricity_tax
     return {
-        "p_sharing_consumer": p2p + network_paid + max(0.0, levies_paid) + tax_paid + service,
+        "p_sharing_consumer": p2p + network_paid + levies + electricity_tax + service,
         "p_network_paid": network_paid,
-        "p_levies_paid": max(0.0, levies_paid),
-        "p_tax_paid": tax_paid,
+        "p_levies_paid": levies,
+        "p_tax_paid": electricity_tax,
         "p_bonus": bonus,
         "p_network_discount": discount,
-        "eeg_exempt": eeg_exempt,
-        "p_renewable_contribution": renewable_contribution,
     }
 
 
@@ -299,8 +293,8 @@ def run_simulation(allocation_keys_by_prosumer, prices, pv_capacities, members_c
     components = {
         "Prosumer-Vergütung": prices["p_sharing"],
         "Netzentgelte (reduziert)": prices["p_network_paid"],
-        "Umlagen und Abgaben (nach Befreiung)": prices["p_levies_paid"],
-        "Elektrizitätsabgabe (nach Befreiung)": prices["p_tax_paid"],
+        "Deutsche Umlagen und Abgaben": prices["p_levies_paid"],
+        "Deutsche Stromsteuer": prices["p_tax_paid"],
         "Servicegebühr": prices["p_servicegebühr"],
     }
     df_payments = pd.DataFrame([
@@ -310,8 +304,8 @@ def run_simulation(allocation_keys_by_prosumer, prices, pv_capacities, members_c
     ]).set_index("Bestandteil")
     bonus_cost = e_shared * prices.get("p_bonus", 0.0)
     network_relief = e_shared * prices["p_netzentgelte"] * prices["p_network_discount"]
-    levy_relief = e_shared * (prices["p_umlagen_abgaben"] - prices["p_levies_paid"])
-    tax_relief = e_shared * (prices["p_stromsteuer"] - prices["p_tax_paid"])
+    levy_relief = 0.0  # Deutsche Umlagen bleiben auch beim Sharing bestehen.
+    tax_relief = 0.0   # Keine pauschale Stromsteuerbefreiung im Modell.
     e_generation = float(sum(v.sum() for v in generation.values()))
     e_self = float(sum(v.sum() for v in own.values()))
     e_surplus = float(sum(v.sum() for v in surplus.values()))
@@ -574,15 +568,16 @@ with st.sidebar:
     st.subheader("Preisparameter [€/kWh]")
     st.caption("Konstante Tarifannahmen für das gesamte Jahr; Jahressummen werden aus den Energiemengen berechnet.")
 
-    p_grid = st.number_input(
-        "Endpreis für Endverbraucher (ohne Sharing) [€/kWh]",
-        value=0.32,
+    # Der reguläre Strompreis wird aus den editierbaren Tarifbestandteilen
+    # berechnet. Beim Restnetzbezug gelten keine Sharing-Vergünstigungen.
+    p_supply = st.number_input(
+        "Energiebeschaffung und Vertrieb (ohne Sharing)",
+        value=0.135,
         min_value=0.0,
-        step=0.01,
-        format="%.3f"
+        step=0.005,
+        format="%.3f",
+        help="Modellannahme für den Energie- und Vertriebsanteil des regulären Netzstroms."
     )
-
-    st.caption("Dieser Endpreis gilt für den Netz- bzw. Reststrombezug und wird nicht zusätzlich aus den untenstehenden Sharing-Tarifkomponenten berechnet.")
 
     p_sharing = st.number_input(
         "P2P-Vergütung",
@@ -609,8 +604,8 @@ with st.sidebar:
     )
 
     p_tax = st.number_input(
-        "Elektrizitätsabgabe (Österreich 2025)",
-        value=0.015,
+        "Stromsteuer (Deutschland)",
+        value=0.0205,
         min_value=0.0,
         step=0.01,
         format="%.3f"
@@ -624,6 +619,10 @@ with st.sidebar:
         format="%.3f"
     )
 
+    # Regulärer Netz-/Reststrompreis ohne Netzentgeltrabatte oder
+    # EEG-Abgabenbefreiungen. Dieselben Komponenten werden nur einmal addiert.
+    p_grid = p_supply + p_network + p_levies + p_tax + p_service
+
     p_feed_in = st.number_input(
         "Einspeisevergütung ohne Energy Sharing [€/kWh]",
         value=0.08,
@@ -635,10 +634,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Anreizmechanismen – Modelljahr 2025")
     st.caption(
-        "Netznutzungsrabatte gelten ausschließlich für tatsächlich geteilte kWh, "
-        "nicht für Restnetzbezug oder Einspeisung und basieren auf der Gemeinschaftsform "
-        "(lokale ESC, regionale ESC und überregionale ESC). "
-        "Die Netzkomponente ist ein editierbarer Modelltarif, kein amtlicher regionaler Preis."
+        "Netznutzungsrabatte gelten ausschließlich für tatsächlich geteilte kWh, nicht für Reststrombezug oder Einspeisung und basieren auf der Gemeinschaftsform (lokale ESC, regionale ESC und überregionale ESC). "
     )
     incentives_enabled = st.radio(
         "Anreizmechanismen aktivieren?",
@@ -647,7 +643,7 @@ with st.sidebar:
             else "Nein – Energy Sharing ohne zusätzliche Anreize",
         horizontal=True,
         help="Bei Nein bleiben P2P-Vergütung und Sharing bestehen, aber es gelten "
-             "keine Netznutzungsrabatte, keine EEG-Abgabenbefreiungen und kein Sharing-Bonus."
+             "keine Netznutzungsrabatte und kein Sharing-Bonus. Deutsche Steuern und Umlagen bleiben in beiden Fällen bestehen."
     )
     at_model = st.selectbox(
         "Netzgebiet / Gemeinschaftsform",
@@ -656,13 +652,6 @@ with st.sidebar:
         disabled=not incentives_enabled,
     )
     at_discount = AT_NETWORK_DISCOUNTS[at_model] if incentives_enabled else 0.0
-    at_eeg = at_model.startswith("EEG") if incentives_enabled else False
-    p_renewable_contribution = st.number_input(
-        "Erneuerbaren-Förderbeitrag innerhalb der Umlagen [€/kWh]",
-        min_value=0.0, max_value=float(p_levies), value=min(0.00796, float(p_levies)),
-        step=0.0001, format="%.5f", disabled=not incentives_enabled,
-        help="Modellannahme für den variablen Förderbeitrag; keine vollständige Tarifabrechnung."
-    )
     bonus_input = st.number_input(
         "Hypothetischer Sharing-Bonus für Prosumer [€/geteilter kWh]",
         value=0.0, min_value=0.0, step=0.01, format="%.3f",
@@ -673,7 +662,7 @@ with st.sidebar:
     p_bonus = bonus_input if incentives_enabled else 0.0
     at_tariff = sharing_tariff(
         p_sharing, p_network, p_levies, p_tax, p_service,
-        at_discount, at_eeg, p_renewable_contribution, p_bonus
+        at_discount, p_bonus
     )
     p_es = at_tariff["p_sharing_consumer"]
     # Der Endpreis ist ein berechneter Tarif, kein zusätzlicher Kostenbestandteil.
@@ -681,20 +670,21 @@ with st.sidebar:
     st.caption(
         f"Berechnung: P2P {p_sharing:.3f} + Netz {at_tariff['p_network_paid']:.3f} "
         f"+ Umlagen {at_tariff['p_levies_paid']:.3f} "
-        f"+ Elektrizitätsabgabe {at_tariff['p_tax_paid']:.3f} "
+        f"+ Stromsteuer {at_tariff['p_tax_paid']:.3f} "
         f"+ Service {p_service:.3f} = {p_es:.3f} €/kWh. "
-        f"Zum Vergleich: Restnetzbezug {p_grid:.3f} €/kWh."
+    )
+    st.metric("Endpreis für Endverbraucher (ohne Sharing)", f"{p_grid:.3f} €/kWh")
+    st.caption(
+        f"Berechnung: Energie/Vertrieb {p_supply:.3f} + Netz {p_network:.3f} "
+        f"+ Umlagen {p_levies:.3f} + Stromsteuer {p_tax:.3f} "
+        f"+ Service {p_service:.3f} = {p_grid:.3f} €/kWh. "
+        "Gilt für regulären Netz- und Reststrombezug ohne Sharing-Vergünstigungen."
     )
     if incentives_enabled:
-        st.caption(
-            f"Netznutzungsrabatt: {at_discount:.0%}. "
-            + ("EEG: Elektrizitätsabgabe und modellierter Erneuerbaren-Förderbeitrag "
-               "auf Sharing-Bezug entfallen."
-               if at_eeg else "Keine EEG-Abgabenbefreiung.")
-        )
+        st.caption(f"Hypothetischer Netznutzungsrabatt: {at_discount:.0%}. Deutsche Stromsteuer und Umlagen bleiben unverändert.")
     else:
         st.info(
-            "Ohne Anreize: 0 % Netznutzungsrabatt, keine Befreiung von Abgaben "
+            "Ohne Anreize: 0 % Netznutzungsrabatt, Abgaben bleiben bestehen "
             "und 0 €/kWh Sharing-Bonus. Energy Sharing und P2P-Zahlungen bleiben aktiv."
         )
     p_residual = 0.0
@@ -714,6 +704,7 @@ with st.sidebar:
 
 prices = {
     "p_grid": p_grid,
+    "p_supply": p_supply,
     "p_sharing": p_sharing,
     "p_netzentgelte": p_network,
     "p_umlagen_abgaben": p_levies,
@@ -1295,9 +1286,8 @@ else:
             "p_bonus": "Hypothetischer Sharing-Bonus",
             "p_network_discount": "Netznutzungsrabatt (Anteil)",
             "p_network_paid": "Netznutzungsentgelt nach Rabatt",
-            "p_levies_paid": "Umlagen nach Befreiung",
-            "p_tax_paid": "Elektrizitätsabgabe nach Befreiung",
-            "p_renewable_contribution": "Erneuerbaren-Förderbeitrag (Modellannahme)"
+            "p_levies_paid": "Deutsche Umlagen beim Sharing",
+            "p_tax_paid": "Deutsche Stromsteuer beim Sharing"
         }
 
         df_prices = pd.DataFrame([
@@ -1320,7 +1310,7 @@ else:
     # --------------------------------------------------------
     with tab5:
         st.subheader("Anreizmechanismen – Modelljahr 2025")
-        st.caption("Die Energiemengen sind bei dieser Preissensitivität fix. Verglichen wird jeweils mit Einspeisevergütung ohne Sharing; alle Werte in €/Jahr.")
+        st.caption("Die Energiemengen sind bei dieser Preissensitivität unverändert; es werden nur die hypothetischen finanziellen Effekte gezeigt.")
         st.caption("Aktive Anreizmechanismen: " + ("Ja" if incentives_enabled else "Nein") +
                    ". Die folgenden Sensitivitäten zeigen hypothetische Alternativen und ändern nicht die aktuelle Simulation.")
         pp = r["parameters"]["prices"]
@@ -1334,94 +1324,135 @@ else:
             "der optionale Sharing-Bonus ist eine zusätzliche externe Zahlung an Prosumer."
         )
         st.metric("Tatsächlich geteilte Energie", f"{total_shared:,.0f} kWh/Jahr")
-        st.caption(f"Gewählte Gemeinschaftsform: {at_model if incentives_enabled else 'Ohne zusätzliche Anreize'}")
-
-        # Die regulatorischen Entlastungen sind keine direkte Auszahlung.
-        # Alle Beträge werden nur auf tatsächlich geteilte Energie angewandt.
-        network_relief = float(r["network_relief"])
-        levy_relief = float(r["levy_relief"])
-        tax_relief = float(r["tax_relief"])
-        bonus_cost = float(total_bonus)
-        regulatory_relief = network_relief + levy_relief + tax_relief
-        combined_effect = regulatory_relief + bonus_cost
-        per_kwh_factor = 100.0 / total_shared if total_shared > 0 else 0.0
+        st.caption(f"Netzentgeltrabatt der Simulation: {pp['p_network_discount']:.0%}")
 
         st.markdown("**A. Regulatorische Entlastungen (Vorteil für Sharing-Bezieher)**")
-        relief_table = pd.DataFrame({
-            "Entlastung": [
-                "Reduziertes Netznutzungsentgelt",
-                "Entfall modellierter Erneuerbaren-Förderbeitrag",
-                "Entfall Elektrizitätsabgabe",
-                "Summe regulatorischer Entlastungen",
-            ],
-            "Angewandte Entlastung [ct/kWh]": [
-                pp["p_netzentgelte"] * pp["p_network_discount"] * 100,
-                (pp["p_umlagen_abgaben"] - pp["p_levies_paid"]) * 100,
-                (pp["p_stromsteuer"] - pp["p_tax_paid"]) * 100,
-                regulatory_relief * per_kwh_factor,
-            ],
-            "Jahresbetrag [€]": [network_relief, levy_relief, tax_relief, regulatory_relief],
-        })
-        st.dataframe(
-            relief_table.style.format({
-                "Angewandte Entlastung [ct/kWh]": "{:.3f}",
-                "Jahresbetrag [€]": "{:,.2f}",
-            }),
-            hide_index=True, use_container_width=True,
-        )
         st.caption(
-            "Netznutzungsentlastung = geteilte kWh × Netzarbeitspreis × Rabatt. "
-            "Abgabenentlastungen = geteilte kWh × jeweils entfallender Modelltarif. "
-            "Die regulären Netzentgelte und Abgaben für Reststrombezug bleiben unverändert."
+            "Jeder Consumer und jeder Sharing-beziehende Prosumer wird einzeln ausgewiesen. "
+            "Nur auf tatsächlich bezogene Sharing-kWh wird der hypothetische "
+            "Netzentgeltrabatt nach österreichischem Vorbild angewendet. "
+            "Deutsche Umlagen, Abgaben und Stromsteuer bleiben im Modell unverändert."
+        )
+        network_discount_ct = (
+            pp["p_netzentgelte"] * pp["p_network_discount"] * 100.0
+        )
+        # Umlagen und Abgaben sind im Eingabemenü ein gemeinsamer Preisparameter.
+        # Ihre einzelnen absoluten Anteile sind deshalb nicht getrennt bekannt.
+        # Die Entlastung beträgt bei beiden ausdrücklich 0 EUR.
+        relief_totals = []
+        for member_id, member_df in sorted(r["member_timeseries"].items()):
+            shared_kwh = float(member_df["Energy Sharing"].sum())
+            if shared_kwh <= 1e-9:
+                continue
+            role = "Prosumer" if f"Prosumer {member_id}" in r["prosumer"].index else "Consumer"
+            member_name = f"{role} {member_id}"
+            st.markdown(f"**{member_name}**")
+            st.caption(f"Sharing-Bezug: {shared_kwh:,.2f} kWh/Jahr")
+            member_reliefs = [
+                ("Reduziertes Netzentgelt", network_discount_ct),
+                ("Umlage", 0.0),
+                ("Abgabe", 0.0),
+                ("Stromsteuer", 0.0),
+            ]
+            member_table = pd.DataFrame([
+                {"Anreiz": name, "Entlastung [ct/kWh]": rate,
+                 "Entlastung [€/Jahr]": shared_kwh * rate / 100.0}
+                for name, rate in member_reliefs
+            ] + [{
+                "Anreiz": "SUMME",
+                "Entlastung [ct/kWh]": sum(rate for _, rate in member_reliefs),
+                "Entlastung [€/Jahr]": shared_kwh * sum(rate for _, rate in member_reliefs) / 100.0,
+            }])
+            st.dataframe(member_table.style.format({
+                "Entlastung [ct/kWh]": "{:.3f}",
+                "Entlastung [€/Jahr]": "{:,.2f}",
+            }), hide_index=True, use_container_width=True)
+            relief_totals.append({"Mitglied": member_name,
+                                  "Sharing-Bezug [kWh]": shared_kwh,
+                                  "Entlastung [€]": shared_kwh * network_discount_ct / 100.0})
+        if relief_totals:
+            st.metric("Gesamte regulatorische Entlastung der Sharing-Bezieher",
+                      f"{sum(x['Entlastung [€]'] for x in relief_totals):,.2f} €/Jahr")
+        else:
+            st.info("Kein Sharing-Bezug vorhanden; es entstehen keine Entlastungen.")
+        st.caption(
+            "Umlagen und Abgaben sind im Eingabemenü ein gemeinsamer Tarifparameter. "
+            "Die hier separat dargestellten Entlastungen betragen jeweils 0 €, "
+            "ebenso die Stromsteuerentlastung. Nur der Netzentgeltrabatt ist eine "
+            "hypothetische Szenarioannahme nach österreichischem Vorbild."
         )
 
-        st.markdown("**B. Zusätzliche externe Förderung (Vorteil für Prosumer)**")
-        funding_table = pd.DataFrame({
-            "Förderung": ["Hypothetischer Sharing-Bonus"],
-            "Fördersatz [ct/kWh]": [pp["p_bonus"] * 100],
-            "Externe Förderkosten [€/Jahr]": [bonus_cost],
-        })
-        st.dataframe(
-            funding_table.style.format({
-                "Fördersatz [ct/kWh]": "{:.3f}",
-                "Externe Förderkosten [€/Jahr]": "{:,.2f}",
-            }),
-            hide_index=True, use_container_width=True,
-        )
-        st.caption(
-            "Bonus = tatsächlich geteilte kWh × Bonus je kWh. "
-            "Dieser Bonus ist eine frei wählbare Modellannahme und keine pauschale "
-            "gesetzliche österreichische Förderung."
-        )
+        st.markdown("**B. Vorteil für Prosumer – Erlöse und Vergleich mit Einspeisevergütung**")
+        st.caption("Je Prosumer zwei kompakte Tabellen: Erlöse und vollständiger Kostenvergleich. "
+                   "Die Szenarien sind Alternativen und werden nicht addiert.")
+        for prosumer_name, prosumer in r["prosumer"].iterrows():
+            st.markdown(f"#### {prosumer_name}")
+            es_p2p = float(prosumer["ES P2P-Erlöse [€]"])
+            es_bonus = float(prosumer["ES Sharing-Bonus [€]"])
+            ref_revenue = float(prosumer["Referenz Einspeiseerlöse [€]"])
+            es_revenue = es_p2p + es_bonus + float(prosumer["ES Restüberschuss-Erlöse [€]"])
+            st.markdown("**Erlösvergleich [€/Jahr]**")
+            revenues = pd.DataFrame({
+                "Position": ["Einspeisevergütung", "P2P-Erlöse", "Externer Sharing-Bonus", "Gesamterlöse", "Erlösdifferenz ES – Referenz"],
+                "Ohne Sharing [€]": [ref_revenue, 0.0, 0.0, ref_revenue, None],
+                "Energy Sharing [€]": [0.0, es_p2p, es_bonus, es_revenue, es_revenue-ref_revenue],
+            })
+            st.dataframe(revenues.style.format({"Ohne Sharing [€]": "{:,.2f}",
+                                                "Energy Sharing [€]": "{:,.2f}"}, na_rep="–"),
+                         hide_index=True, use_container_width=True)
+            st.markdown("**Wirtschaftlicher Gesamtvergleich [€/Jahr]**")
+            costs = pd.DataFrame({
+                "Position": ["Netzbezugskosten", "Sharing-Bezugskosten", "Abzüglich Erlöse", "Nettostromkosten"],
+                "Einspeisevergütung [€]": [
+                    float(prosumer["Referenz Netzbezugskosten [€]"]), 0.0,
+                    -ref_revenue, float(prosumer["Referenz Nettostromkosten [€]"])],
+                "Energy Sharing [€]": [
+                    float(prosumer["ES Netzbezugskosten [€]"]),
+                    float(prosumer["ES Sharing-Bezugskosten [€]"]),
+                    -es_revenue, float(prosumer["ES Nettostromkosten [€]"])],
+            })
+            st.dataframe(costs.style.format({"Einspeisevergütung [€]": "{:,.2f}",
+                                             "Energy Sharing [€]": "{:,.2f}"}),
+                         hide_index=True, use_container_width=True)
+            st.metric("Wirtschaftlicher Vorteil durch Energy Sharing",
+                      f"{float(prosumer['Vorteil ES [€]']):+,.2f} €/Jahr")
+            st.divider()
+        st.caption("Erlöse und Nettostromkosten sind unterschiedliche Kennzahlen: "
+                   "Der Gesamtvergleich berücksichtigt auch den veränderten Eigenverbrauch "
+                   "sowie den Netz- und Sharing-Bezug.")
 
         st.markdown("**C. Zusammenfassung und wirtschaftliche Einordnung**")
+        total_network = sum(x["Entlastung [€]"] for x in relief_totals)
+        total_bonus = float(r["external_bonus_cost"])
         summary_table = pd.DataFrame({
             "Kennzahl": [
-                "Regulatorische Entlastungen gesamt",
-                "Zusätzliche externe Förderkosten",
-                "Entlastungen und Förderungen zusammen",
-                "Gesamter wirtschaftlicher Vorteil der Mitglieder gegenüber Einspeisevergütung",
-            ],
+                "Netzentgeltentlastung", "Umlagen-/Abgabenentlastung", "Stromsteuerentlastung",
+                "Gesamte regulatorische Entlastung", "Zusätzlicher Sharing-Bonus",
+                "Wirtschaftlicher Vorteil Prosumer", "Wirtschaftlicher Vorteil Consumer",
+                "Wirtschaftlicher Vorteil der Gemeinschaft"],
+            "Relevant für": [
+                "Sharing-beziehende Consumer und Prosumer", "Sharing-Bezieher (hier keine Befreiung)",
+                "Sharing-Bezieher (hier keine Befreiung)", "Alle Sharing-Bezieher",
+                "Prosumer (Erlös); externer Fördergeber (Kosten)", "Prosumer", "Consumer",
+                "Prosumer und Consumer"],
             "Wert [€/Jahr]": [
-                regulatory_relief, bonus_cost, combined_effect, float(r["community_benefit"]),
-            ],
+                total_network, 0.0, 0.0, total_network, total_bonus,
+                float(r["prosumer_savings"]), float(r["consumer_savings"]),
+                float(r["community_benefit"])],
         })
-        st.dataframe(
-            summary_table.style.format({"Wert [€/Jahr]": "{:,.2f}"}),
-            hide_index=True, use_container_width=True,
+        st.dataframe(summary_table.style.format({"Wert [€/Jahr]": "{:,.2f}"}),
+                     hide_index=True, use_container_width=True)
+        st.caption(
+            "Die regulatorische Entlastung ist bereits in den Sharing-Bezugskosten "
+            "und damit im wirtschaftlichen Vorteil enthalten; nicht nochmals addieren. "
+            "Der P2P-Preis ist eine Zahlung innerhalb der Gemeinschaft. Der Sharing-Bonus "
+            "ist eine externe Zahlung an Prosumer und verursacht externe Förderkosten. "
+            "Der Gemeinschaftsvorteil berücksichtigt auch Eigenverbrauch und entgangene Einspeiseerlöse."
         )
-        st.info(
-            "Die Summe aus Entlastungen und Förderungen ist **nicht** mit dem wirtschaftlichen "
-            "Vorteil der Gemeinschaft gleichzusetzen: Dieser berücksichtigt zusätzlich "
-            "Eigenverbrauch, Netzbezug, P2P-Zahlungen und entgangene Einspeiseerlöse. "
-            "P2P-Zahlungen sind zunächst interne Transfers zwischen Mitgliedern. "
-            "Entlastungen sind verminderte Tarifzahlungen, nicht automatisch direkte "
-            "Ausgaben eines Fördergebers."
-        )
-        if total_shared <= 0:
-            st.warning("Es wurde keine Energie geteilt; daher sind alle kWh-bezogenen Entlastungen null.")
         if not incentives_enabled:
-            st.caption("Anreizmechanismen deaktiviert: Alle regulatorischen Entlastungen und der externe Bonus betragen 0 €.")
+            st.caption("Zusätzliche Anreize deaktiviert: Netzentgeltrabatt und Sharing-Bonus betragen 0.")
+        if total_shared <= 0:
+            st.warning("Es wurde keine Energie geteilt; kWh-bezogene Entlastungen und Bonuszahlungen entfallen.")
 
         st.markdown("**Sensitivität des P2P-Preises**")
         p2p_values = np.linspace(0.04, 0.25, 22)
@@ -1434,14 +1465,13 @@ else:
         sensitivity["Gemeinschaftsvorteil [€/Jahr]"] = sensitivity.sum(axis=1)
         st.line_chart(sensitivity)
         st.caption("Der P2P-Preis verschiebt den Vorteil zwischen Prosumern und Consumern. Bei fixen Energiemengen bleibt die Summe unverändert.")
-        st.markdown("**Vergleich österreichischer Netzentgeltmodelle**")
+        st.markdown("**Vergleich hypothetischer Netzentgeltrabatte nach österreichischem Vorbild**")
         comparisons = []
         for name, discount in AT_NETWORK_DISCOUNTS.items():
-            eeg = name.startswith("EEG")
             scenario_tariff = sharing_tariff(
                 pp["p_sharing"], pp["p_netzentgelte"], pp["p_umlagen_abgaben"],
-                pp["p_stromsteuer"], pp["p_servicegebühr"], discount, eeg,
-                pp["p_renewable_contribution"], pp["p_bonus"]
+                pp["p_stromsteuer"], pp["p_servicegebühr"], discount,
+                pp["p_bonus"]
             )
             consumer_delta = (pp["p_sharing_consumer"] - scenario_tariff["p_sharing_consumer"]) * total_shared
             comparisons.append({
@@ -1454,7 +1484,7 @@ else:
             })
         comparison_df = pd.DataFrame(comparisons).set_index("Gemeinschaftsform")
         st.dataframe(comparison_df.style.format("{:,.2f}"), use_container_width=True)
-        st.caption("Vereinfachter Vergleich bei identischer PV-Zuteilung. Tarifbestandteile und Netznutzungsentgelt müssen für einen realen österreichischen Netzbetreiber konkretisiert werden.")
+        st.caption("Hypothetischer Vergleich: deutsche Strompreisbestandteile, österreichische Netzentgeltrabatte als Szenarioannahme. Keine geltende deutsche Netzentgeltvergünstigung.")
         st.markdown("**Hypothetischer externer Sharing-Bonus**")
         bonus_values = np.linspace(0, 0.10, 11)
         bonus_sens = pd.DataFrame({
